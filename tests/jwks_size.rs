@@ -24,8 +24,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
 use url::Url;
 
 use axum_oidc_middleware::{AuthConfig, AuthError, Authenticator, CachePolicy, Issuer};
@@ -50,6 +52,12 @@ const WRITE_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long the responder waits for a request before giving up on it.
 const READ_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long the responder waits for the client to end the connection.
+///
+/// A connection the client keeps for reuse never ends, so this budget expiring
+/// is a normal outcome and not a failed measurement.
+const CLOSE_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a test waits for the responder to finish after the client call
 /// returns. The refusal itself is immediate. What lags behind it is the
@@ -188,6 +196,15 @@ struct Progress {
     bytes: AtomicUsize,
     /// A write failed or stalled, so the client stopped taking the body.
     abandoned: AtomicBool,
+    /// The client's stack reset the connection. A peer resets when it closes
+    /// with bytes still unread in its kernel, so this means the client stopped
+    /// taking the body. Unlike a failed write, it does not depend on how much
+    /// the peer's receive window was willing to hold.
+    reset: AtomicBool,
+    /// The client read what the responder sent and closed the connection
+    /// cleanly. The opposite reading of `reset`, and the outcome these tests
+    /// must not mistake for a hang-up.
+    drained: AtomicBool,
     /// The responder finished its write loop, whether it sent the body or was
     /// refused part-way. Lets a test wait for the outcome instead of guessing
     /// at how long a blocked write needs to notice the socket closed.
@@ -264,9 +281,37 @@ impl HostileIssuer {
         self.progress.chunks.load(Ordering::SeqCst)
     }
 
-    /// Whether the client stopped reading before the body was finished.
-    fn abandoned(&self) -> bool {
-        self.progress.abandoned.load(Ordering::SeqCst)
+    /// Whether the client stopped taking the body before it was finished.
+    ///
+    /// Two independent observations. A write that failed or stalled is the
+    /// direct one. A reset from the peer holds on every operating system. A
+    /// peer that closes with unread bytes in its kernel always resets, whatever
+    /// its buffers accepted first.
+    fn left_body_unread(&self) -> bool {
+        self.progress.abandoned.load(Ordering::SeqCst) || self.progress.reset.load(Ordering::SeqCst)
+    }
+
+    /// Whether the client read the body and closed the connection cleanly.
+    /// Only meaningful after [`HostileIssuer::settle_close`].
+    fn peer_drained(&self) -> bool {
+        self.progress.drained.load(Ordering::SeqCst)
+    }
+
+    /// Wait for the client to end the connection, so the two signals above are
+    /// read settled rather than mid-close.
+    ///
+    /// No assertion here. A client that accepted the document keeps the
+    /// connection for reuse, and that connection never ends within the budget.
+    /// Such a run reports neither signal, and a test that expects a hang-up
+    /// fails on its own verdict instead.
+    async fn settle_close(&self) {
+        let deadline = Instant::now() + CLOSE_BUDGET;
+        while !(self.progress.reset.load(Ordering::SeqCst)
+            || self.progress.drained.load(Ordering::SeqCst))
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Wait for the responder to finish writing — body delivered or client
@@ -301,16 +346,19 @@ async fn serve(listener: TcpListener, plan: Arc<Plan>, progress: Arc<Progress>) 
         let plan = plan.clone();
         let progress = progress.clone();
         tokio::spawn(async move {
-            answer(socket, &plan, &progress).await;
+            answer(socket, &plan, progress.clone()).await;
             progress.done.store(true, Ordering::SeqCst);
         });
     }
 }
 
-async fn answer(mut socket: TcpStream, plan: &Plan, progress: &Progress) {
+async fn answer(socket: TcpStream, plan: &Plan, progress: Arc<Progress>) {
     progress.requests.fetch_add(1, Ordering::SeqCst);
 
     let _ = socket.set_nodelay(true);
+
+    // Split so the close can be watched while the body is still being written.
+    let (mut reader, mut writer) = socket.into_split();
 
     // Drain the request, or at least the part that arrived. Nothing reads the
     // answer's side of the conversation. But leaving the request unread would
@@ -319,7 +367,7 @@ async fn answer(mut socket: TcpStream, plan: &Plan, progress: &Progress) {
     let mut scratch = [0u8; 4096];
     let _ = tokio::time::timeout(READ_BUDGET, async {
         while !request.ends_with(b"\r\n\r\n") {
-            let read = socket.read(&mut scratch).await?;
+            let read = reader.read(&mut scratch).await?;
             if read == 0 {
                 break;
             }
@@ -329,8 +377,13 @@ async fn answer(mut socket: TcpStream, plan: &Plan, progress: &Progress) {
     })
     .await;
 
+    // Watch the read direction for how this connection ends. Writes cannot
+    // show it: a peer whose receive window is wide takes a whole body on its
+    // application's behalf, and every write to it then succeeds.
+    watch_close(reader, progress.clone());
+
     for line in &plan.head {
-        if send(&mut socket, line.as_bytes()).await.is_err() {
+        if send(&mut writer, line.as_bytes()).await.is_err() {
             progress.abandoned.store(true, Ordering::SeqCst);
             return;
         }
@@ -340,7 +393,7 @@ async fn answer(mut socket: TcpStream, plan: &Plan, progress: &Progress) {
     // hung up shows up as a failure on the write after the one it stopped at.
     for (index, chunk) in plan.chunks.iter().enumerate() {
         let wire = chunk.on_the_wire();
-        match send(&mut socket, &wire).await {
+        match send(&mut writer, &wire).await {
             Ok(written) => {
                 progress.bytes.fetch_add(written, Ordering::SeqCst);
                 progress.chunks.fetch_add(1, Ordering::SeqCst);
@@ -365,12 +418,51 @@ async fn answer(mut socket: TcpStream, plan: &Plan, progress: &Progress) {
     if !plan.truncate {
         for chunk in &plan.chunks {
             if matches!(chunk, Chunk::Chunked(_)) {
-                let _ = socket.write_all(b"0\r\n\r\n").await;
+                let _ = writer.write_all(b"0\r\n\r\n").await;
                 break;
             }
         }
     }
-    let _ = socket.shutdown().await;
+    let _ = writer.shutdown().await;
+}
+
+/// Record how the client ends the connection, on the half the client never
+/// writes to.
+///
+/// A peer that closes with bytes still unread in its kernel sends a reset, and
+/// a peer that read everything sends a clean finish. That is what `drained` and
+/// `reset` distinguish, and it holds on every operating system. The write
+/// direction cannot carry this claim, because a wide receive window absorbs a
+/// whole body for an application that never reads it.
+///
+/// The read is never expected to return data: the client sends its request and
+/// then only reads. Any byte that does arrive is discarded and ignored.
+fn watch_close(mut reader: OwnedReadHalf, progress: Arc<Progress>) {
+    tokio::spawn(async move {
+        let mut seen = [0u8; 512];
+        let closed_cleanly = tokio::time::timeout(CLOSE_BUDGET, async {
+            loop {
+                match reader.read(&mut seen).await {
+                    Ok(0) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        })
+        .await;
+        match closed_cleanly {
+            // The stream ended and the peer closed it. It read what the
+            // responder sent.
+            Ok(true) => progress.drained.store(true, Ordering::SeqCst),
+            // The read failed, which is a reset: the peer closed with bytes it
+            // never read. This is the hang-up signal that does not depend on
+            // how wide the peer's receive window was.
+            Ok(false) => progress.reset.store(true, Ordering::SeqCst),
+            // The budget ran out. The client kept this connection for reuse, so
+            // there is no verdict to record.
+            Err(_) => {}
+        }
+    });
 }
 
 /// One write, bounded. The `Ok` is how many bytes the kernel took. An error
@@ -378,7 +470,10 @@ async fn answer(mut socket: TcpStream, plan: &Plan, progress: &Progress) {
 /// measurement. It says how much of the body the client let through before
 /// refusing. A blocked write is an error too: a client that will not drain is
 /// the same event as one that closed.
-async fn send(socket: &mut TcpStream, bytes: &[u8]) -> Result<usize, (usize, io::Error)> {
+async fn send<W>(socket: &mut W, bytes: &[u8]) -> Result<usize, (usize, io::Error)>
+where
+    W: AsyncWrite + Unpin,
+{
     let attempt = tokio::time::timeout(WRITE_BUDGET, async {
         let mut written = 0;
         let result: io::Result<()> = async {
@@ -484,19 +579,20 @@ async fn a_chunked_body_over_the_cap_is_refused_as_it_arrives() {
     // buffer once the peer stops reading. So the measure is how much of the
     // body the responder managed to write at all.
     issuer.settle().await;
+    issuer.settle_close().await;
     assert!(
-        issuer.abandoned(),
+        issuer.left_body_unread(),
         "the client took the whole {body_bytes} byte body instead of hanging up, \
-         so the cap bounded a check rather than the download"
+         so the cap bounded a check rather than the download. The responder wrote \
+         {} bytes, and the peer closed clean: {}",
+        issuer.sent(),
+        issuer.peer_drained()
     );
-    assert!(
-        issuer.sent() * 2 < body_bytes,
-        "the responder wrote {} of {body_bytes} body bytes before the client hung \
-         up; anything this far short of the end is the refusal arriving first, and \
-         the peak the client held is bounded by the cap plus one chunk, not by \
-         the body",
-        issuer.sent()
-    );
+    // No verdict on `sent()` here. It counts what the peer's kernel accepted,
+    // and a wide receive window accepts a whole body for an application that
+    // never reads it. The memory claim is asserted below in the client's own
+    // words. It names the byte count the client stopped at, over the cap and
+    // short of the body.
 
     // One fetch, not one fetch per refused chunk: the cap ends the download, it
     // does not restart it. A client that retried after refusing an oversized
@@ -564,11 +660,13 @@ async fn a_body_that_overruns_its_declared_length_is_refused() {
         "a body that overruns a 12-byte `Content-Length` must be refused, got {outcome:?}"
     );
     issuer.settle().await;
+    issuer.settle_close().await;
     assert!(
-        issuer.abandoned() && issuer.sent() * 2 < body_bytes,
-        "the declared length was honoured only after {} of {body_bytes} body bytes \
-         had already been written, so the lie bought the body the whole download",
-        issuer.sent()
+        issuer.left_body_unread(),
+        "a client that obeyed the 12-byte lie and read on would have taken all \
+         {body_bytes} bytes; the responder wrote {} and the peer closed clean: {}",
+        issuer.sent(),
+        issuer.peer_drained()
     );
 
     // Refused *because of size*, not incidentally. A truncated or malformed
