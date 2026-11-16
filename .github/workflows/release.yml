@@ -71,24 +71,34 @@ jobs:
     permissions:
       contents: write
     steps:
-      # No checkout step. `gh release create` is an API call. GitHub computes
-      # `--generate-notes` from merged pull requests, not from a working tree.
+      # No checkout step. Every command here is one API call, and `-R` names the
+      # repository, so none of them resolves it from a working tree. GitHub
+      # computes `--generate-notes` from merged pull requests, not from git.
       - name: Create the release for this tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+          repo="$GITHUB_REPOSITORY"
+
+          if gh release view "$GITHUB_REF_NAME" -R "$repo" >/dev/null 2>&1; then
             echo "release $GITHUB_REF_NAME already exists; leaving it as is"
             exit 0
           fi
 
-          # `--verify-tag` aborts unless the tag exists in the repository. A
-          # re-run from a branch therefore cannot invent a release for a version
-          # that nobody tagged. The check above turns a re-run after a partial
-          # failure into a no-op instead of an error.
-          gh release create "$GITHUB_REF_NAME" \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --verify-tag
+          # The tag has to exist in the repository, so a re-run from a branch
+          # cannot invent a release for a version nobody tagged. Ask the API:
+          # the repository holds the answer. `--verify-tag` asked a local git
+          # tree instead, and this job has none. It aborted on v0.1.0 with
+          # "failed to run git: fatal: not a git repository". The guard above
+          # turns a re-run after a partial failure into a no-op.
+          gh api "repos/$repo/git/ref/tags/$GITHUB_REF_NAME" >/dev/null
 
-          gh release view "$GITHUB_REF_NAME" --json url -q .url
+          # `--target` pins the release to the commit this run built from.
+          # That is what the tag names here.
+          gh release create "$GITHUB_REF_NAME" \
+            -R "$repo" \
+            --target "$GITHUB_SHA" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+          gh release view "$GITHUB_REF_NAME" -R "$repo" --json url -q .url
