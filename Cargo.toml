@@ -1,0 +1,145 @@
+[package]
+name = "axum-oidc-middleware"
+description = "Bearer-token authentication for Axum against one or more OIDC issuers (Google, Keycloak, ...)"
+repository = "https://github.com/thomascjohnson/axum_oidc_middleware"
+# `homepage` is absent on purpose. Cargo's manifest guide says to set it only
+# for a dedicated website, and not to make it redundant with `repository` or
+# `documentation`. This crate has no site beyond those two pages.
+#
+# crates.io links a crate to docs.rs on its own once the build exists, so
+# `documentation` is not strictly needed. This file states the link anyway, so a
+# caller sees it in the manifest instead of trusting a default.
+documentation = "https://docs.rs/axum-oidc-middleware"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+readme = "README.md"
+keywords = ["axum", "oidc", "openid-connect", "jwt", "authentication"]
+categories = [
+    "authentication",
+    "web-programming::http-server",
+    "network-programming",
+]
+
+# Ship the source, the tests, the examples, and the three documents a caller
+# reads. Keep the development infrastructure out.
+#
+# `include` is a whitelist, so a stray `notes.md` or a local `.env` in the
+# working tree cannot ride along with a publish you cannot undo. `exclude` ships
+# everything it does not name. That is the wrong default for a one-way
+# operation.
+#
+# `tests/` and `examples/` stay in. A caller who vendors this crate can then
+# run the suite the README points at. A reviewer can read the checks behind the
+# claims in that README.
+#
+# `rust-toolchain.toml` stays out on purpose. It pins 1.100.0, the toolchain the
+# maintainers use. `rust-version` above is the promise to a caller: 1.89. Two
+# numbers in one tarball ask a reader to reconcile them, and the bigger one
+# would send them installing a toolchain they do not need.
+#
+# `Cargo.lock` ships no matter what you write here, and no `include` list
+# removes it. Cargo adds that file, `Cargo.toml`, `Cargo.toml.orig`, and
+# `.cargo_vcs_info.json` to every package. The note is here so the next person
+# does not spend an hour on a key that has no effect. A caller's cargo ignores
+# that file for a dependency, so it ships as provenance for this tree, not as a
+# claim about supported versions.
+include = [
+    "/src/**",
+    "/tests/**",
+    "/examples/**",
+    "/README.md",
+    "/SECURITY.md",
+    "/LICENSE",
+]
+
+[dependencies]
+base64 = "0.23.1"
+# The middleware needs only the request and response types from axum. The
+# test suite uses `serve`, `Json`, and the TLS and listener defaults. The
+# library does not. Enable those features in `[dev-dependencies]` instead.
+# Cargo unions them back in when it builds the tests.
+axum = { version = "0.8.9", default-features = false }
+jsonwebtoken = { version = "11.1.0", default-features = false, features = [
+    "rust_crypto",
+    "use_pem",
+] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "rustls-no-provider",
+    "http2",
+    "json",
+] }
+rustls = { version = "0.23.46", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+# Use `sync` for the JWKS cache and `time` for refresh pacing. The runtime,
+# the test macro, and the listener belong to the tests and the examples, so
+# `[dev-dependencies]` declares them. A library must not choose the runtime of
+# its caller.
+tokio = { version = "1.54.1", default-features = false, features = [
+    "sync",
+    "time",
+] }
+tracing = "0.1.44"
+url = "2.5.8"
+serde_json = "1.0.154"
+
+
+[dev-dependencies]
+# These are the features the library declines to enable. The harness needs
+# them. `serve` (`tokio`, `http1`) and `Json` (`json`) drive the mock identity
+# providers. `rt-multi-thread` is here for the same reason. The examples use
+# `#[tokio::main]`, the way a real service does. The tests stay on the
+# single-threaded runtime that `#[tokio::test]` gives them. `signal` serves
+# only the graceful shutdown in quickstart. A library that enabled either one
+# would choose the runtime and the exit conditions of its caller.
+axum = { version = "0.8.9", features = ["http1", "json", "tokio"] }
+ed25519-dalek = { version = "2.2.0", features = ["pkcs8", "rand_core"] }
+p256 = { version = "0.13.2", features = ["ecdsa"] }
+p384 = { version = "0.13.1", features = ["ecdsa"] }
+rand = "0.8"
+rsa = "0.9.10"
+tokio = { version = "1.54.1", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt",
+    "rt-multi-thread",
+    "signal",
+    "time",
+] }
+
+# docs.rs builds with every feature, so a feature flag added later cannot
+# silently hide a module from the published docs. It also passes
+# `--cfg docsrs`, so a nightly-only rustdoc gate can depend on it.
+# `[lints.rust]` below declares that cfg, so it cannot trigger
+# `unexpected_cfgs` on stable.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Lint levels for the whole package. They apply to every target here. Cargo
+# caps lints for dependencies, so shipping these cannot make a caller's build
+# noisy.
+[lints.rust]
+# Every public item already has a doc comment, so this rule keeps a fact
+# rather than adding work. The current tree passes with no findings.
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+
+[lints.clippy]
+# The current tree has no `.unwrap()`. The lint fired on a scratch file before
+# this entry existed, so the rule is live and not decoration. The library has 2
+# uses of `expect`, and the test suite has 720. `clippy::expect_used` therefore
+# stays out: `[lints]` has no per-target override. To get that rule, gate it on
+# `not(test)` inside `src/lib.rs`.
+unwrap_used = "warn"
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 2

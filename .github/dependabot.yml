@@ -1,0 +1,76 @@
+# Nothing refreshed dependencies in this repository before this file existed.
+# `security.yml` reads the RustSec database on a Monday cron and on any change
+# to `Cargo.toml` or `Cargo.lock`. No automation ever produced such a change. A
+# red security job therefore had one route back to green: a person notices, then
+# edits the lock by hand.
+#
+# Dependabot opens the pull requests instead. A dependency bump then goes
+# through the same gates as any other change: `mise run ci`, the MSRV build on
+# 1.89, the platform matrix, and the `deps` gate in `mise.toml`. That last one
+# matters most for a major bump. `cargo audit` cannot see the failure mode where
+# reqwest moves to a new rustls major and the process-wide crypto provider
+# lands in a copy reqwest never reads. The `deps` gate can.
+#
+# Turn on the global Dependabot switch in the repository settings. This file
+# alone does nothing. Also turn on security updates if you want a patch pull
+# request for an advisory, before an ordinary release would carry the fix.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      # Tuesday, not Monday. `security.yml` runs Mondays at 04:17 UTC. Two jobs
+      # that both touch `Cargo.lock` should not start in the same hour, and this
+      # file is what changes it.
+      interval: weekly
+      day: tuesday
+      time: "05:17"
+      timezone: "Etc/UTC"
+    # One pull request per group, not one per crate. A weekly bump of a
+    # 215-crate graph would otherwise bury the one line that matters.
+    #
+    # Wait seven days after a release before proposing it. A fresh release is
+    # too new to look wrong in public. A dependency that is malicious on day
+    # zero often looks ordinary on day eight. This crate reads its trust anchors
+    # through `reqwest` and `rustls`, so a bad release here is not merely a
+    # broken build.
+    cooldown:
+      default-days: 7
+    groups:
+      semver-compliant:
+        patterns:
+          - "*"
+        # `minor` and `patch`, not `version-update:semver-minor`. That longer
+        # spelling belongs to `allow` rules. In `groups` the accepted values are
+        # the bare semver levels.
+        update-types:
+          - "minor"
+          - "patch"
+    # A major bump stays its own pull request, because a major is a decision.
+    # `reqwest 1.0` or `rustls 0.24` can change which compiled crate holds the
+    # crypto provider. Grouping a major with a patch hides that decision in a
+    # diff nobody reads.
+    open-pull-requests-limit: 5
+    commit-message:
+      # `chore` is one of the accepted types in
+      # `.github/workflows/conventional-commits.yml`. See that file for why a
+      # Dependabot title still needs an exemption there.
+      prefix: "chore"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "05:23"
+      timezone: "Etc/UTC"
+    # The same reason applies here, and sharper. A workflow change runs with
+    # this repository's credentials. A new action release therefore deserves the
+    # same week of public scrutiny as a new crate version.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      # These are workflow files, so `ci` fits better than `chore`. Both are
+      # accepted types.
+      prefix: "ci"

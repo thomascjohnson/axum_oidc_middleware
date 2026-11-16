@@ -1,0 +1,47 @@
+# This job makes the advisory claim in SECURITY.md more than a sentence. CI
+# reads the same database that `cargo audit` reads. CI then finds an advisory
+# against a dependency instead of a downstream user.
+#
+# This job says nothing about the defects of this crate. A dependency audit
+# cannot see an authentication bypass in the verification path. The reporting
+# route in SECURITY.md is the other half of the answer.
+
+name: Security
+
+on:
+  schedule:
+    # Mondays at 04:17 UTC. Every other cron job queues on the hour, and this
+    # job also fetches the advisory database from GitHub.
+    - cron: '17 4 * * 1'
+  push:
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/security.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Install a prebuilt binary. `cargo install cargo-audit` spends several
+      # minutes compiling for no gain here.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # Run plain `cargo audit`, without `--deny warnings`. A yanked transitive
+      # dependency is a real signal, not a broken build. People ignore a job
+      # that cries about it, and they start ignoring it after the first Friday.
+      #
+      # `cargo deny check advisories` is absent on purpose. It needs a deny.toml
+      # that states this project's policy on licenses and unmaintained crates.
+      # That is a decision to make, not a step to add.
+      - run: cargo audit

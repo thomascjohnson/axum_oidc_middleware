@@ -1,0 +1,363 @@
+# One place for every gate in this project. Then "mise run ci passes" and
+# "CI is green" mean the same thing.
+#
+# The workflow files call these tasks. They do not repeat cargo commands.
+# A workflow that repeats them drifts away from what contributors run. A
+# contributor finds that drift. CI does not.
+#
+# `rust-toolchain.toml` pins Rust. Do not pin a toolchain here as well. Two
+# sources of truth disagree within a week, once somebody updates one of them.
+
+# ---------------------------------------------------------------- format
+
+[tasks."fmt"]
+description = "Rewrite the tree with rustfmt"
+run = "cargo fmt --all"
+
+[tasks."fmt-check"]
+description = "Fail if rustfmt would change anything"
+run = "cargo fmt --all --check"
+
+# ---------------------------------------------------------------- lints
+
+[tasks.clippy]
+description = "Check every target with Clippy and treat warnings as errors"
+# Pass `--all-targets`. The `[lints]` table in Cargo.toml sets levels for
+# tests and examples too. A job that checks only the library misses those.
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+# ---------------------------------------------------------------- tests
+
+[tasks.test]
+description = "Run unit tests, integration tests, and doctests"
+# Do not pass `--all-targets`. That flag skips doctests. The doctests keep
+# README.md and the crate-level docs true. `cargo test` builds the examples
+# as well.
+run = "cargo test"
+
+[tasks.examples]
+description = "Run the examples that need no network"
+# `test` compiles the examples that need a real issuer. These two create
+# their own OIDC provider on loopback. They prove that the whole path works,
+# not only that it type-checks.
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+cargo run --example protected_api
+cargo run --example optional_auth
+"""
+
+# ---------------------------------------------------------------- docs
+
+[tasks.doc]
+description = "Build the docs that docs.rs shows and treat warnings as errors"
+# `-D warnings` extends `#![deny(rustdoc::broken_intra_doc_links)]` to the
+# rest of rustdoc. docs.rs does not fail a build on warnings. Without this
+# flag, a link that resolves to nothing reaches docs.rs with no signal.
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = "cargo doc --no-deps"
+
+# ---------------------------------------------------------------- minimum supported Rust
+
+[tasks.msrv]
+description = "Build and test on the MSRV declared in Cargo.toml"
+# Read the version from `rust-version`. Do not repeat it here. The manifest
+# stays the only place that records the supported range.
+#
+# `cargo +<toolchain>` outranks `rust-toolchain.toml`. That is the only reason
+# this job tests anything. Otherwise the pin in that file wins, and an "MSRV
+# job" runs on the pinned compiler without saying so. The `rustc --version`
+# line is the guard rail. If it prints the wrong number, the job no longer
+# tests what its name promises.
+# The script is a TOML *literal* string ('''), not a basic one ("""). Basic
+# strings process backslashes, and that turns the sed patterns below into
+# invalid escape sequences.
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+msrv=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)
+if [ -z "$msrv" ]; then
+    echo "no rust-version key in Cargo.toml" >&2
+    exit 1
+fi
+# rust-version may be a partial form such as `1.98`. rustup needs `1.98.0`.
+# The patch-zero form is also the strictest reading of the claim.
+case "$msrv" in
+    *.*.*) ;;
+    *) msrv="$msrv.0" ;;
+esac
+
+rustup toolchain install "$msrv" --profile minimal --component clippy
+echo "toolchain under test: $(rustc +"$msrv" --version)"
+cargo +"$msrv" --version
+cargo +"$msrv" clippy --all-targets --all-features -- -D warnings
+cargo +"$msrv" test
+'''
+
+# ---------------------------------------------------- minimal versions: absent
+#
+# A `-Z minimal-versions` job answers a question the `msrv` job cannot: does the
+# crate build when cargo picks the oldest version each range allows? This
+# repository has no such job, and cannot have one today.
+#
+# `cargo +nightly -Z minimal-versions check --lib` fails inside `num-bigint
+# 0.4.0`, and that is not code from this crate. `jsonwebtoken 11.1` names
+# `simple_asn1 0.6.0`, and that release resolves `num-bigint 0.4.0`. One call in
+# it now binds the inherent `u64::div_ceil` instead of the trait method, so the
+# file does not compile. The chain is a regular dependency. Deleting
+# `[dev-dependencies]` changes nothing.
+#
+# The two ways to force the job green both cost more than they return. Add a
+# floor for `num-bigint` to `[dependencies]`, and the published library ships a
+# dependency it never uses, solely to satisfy one CI mode. Or wait for upstream.
+# This file waits. Re-run the command above when `jsonwebtoken` moves.
+#
+# No downstream user is broken by this. Cargo picks the newest version inside a
+# caret range, so an ordinary build never resolves `num-bigint 0.4.0`. The
+# absent job is a missing check, not a reported bug.
+
+# ---------------------------------------------------------------- dependency graph
+
+[tasks.deps]
+description = "Fail if cargo resolves a second rustls version"
+# `src/http.rs` installs `ring` as the process-wide rustls crypto provider. It
+# does that through *this* crate's `rustls` dependency. `reqwest` uses
+# `rustls-no-provider` and reads the provider from the `rustls` copy *it*
+# links. Those are the same compiled crate only while the graph resolves one
+# `rustls` version.
+#
+# A reqwest release can move to a new rustls major. Both copies then coexist,
+# cargo resolves that without a word, and `install_default()` configures a copy
+# reqwest never reads. `reqwest::Client::builder().build()` then panics on the
+# first JWKS fetch. That fetch is the first thing the crate does in a real
+# deployment. No test catches it. Every test stubs an issuer over plain HTTP on
+# loopback, so the test path never consults the provider. This task therefore
+# asserts the assumption here. A dependency bump then fails a pull request
+# instead of a customer's startup.
+#
+# This gate checks `rustls` alone. That narrowness is the point. Two copies of
+# other crates are harmless. This graph already carries two copies of `base64`,
+# because jsonwebtoken sits a version behind. A gate that reports every
+# duplicate cries on the first Friday, and people ignore a job that cries.
+# `-e normal` drops dev and build dependencies. A second rustls reachable only
+# from a test harness cannot panic the library's client.
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Read the versions as one newline-separated string, and count them with
+# `grep -c`. Do not reach for a bash array here. The array length
+# expansion starts with a dollar sign, an open brace, and a hash. mise reads
+# that hash as the start of a template comment and refuses to parse this whole
+# file. The same trap rules out any dollar-and-brace form in a task body.
+# Plain `$name` is fine. The note lives here because a task body is the only
+# place it bites.
+versions=$(cargo tree --prefix none -e normal | awk '$1 == "rustls" { print $2 }' | sort -u)
+count=$(printf '%s\n' "$versions" | grep -c . || true)
+
+if [ "$count" -ne 1 ]; then
+    echo "refusing: the graph resolves $count rustls versions." >&2
+    echo "src/http.rs can install a process-wide crypto provider in one of them." >&2
+    printf '%s\n' "$versions" | sed 's/^/  rustls /' >&2
+    echo >&2
+    echo "Align the two versions. Or drop the provider install in src/http.rs and" >&2
+    echo "leave the crypto backend to the host binary. Either choice keeps this" >&2
+    echo "promise." >&2
+    exit 1
+fi
+
+echo "one rustls ($versions): the provider install reaches reqwest"
+'''
+
+# ---------------------------------------------------------------- packaging
+
+[tasks.package]
+description = "Package the crate, then build that package on its own"
+# Pass `--allow-dirty`. This task checks the contents of the crate. Git
+# hygiene is a different question, and nothing here depends on it. Nothing
+# important is lost. Cargo unpacks the tarball and builds it outside the
+# workspace. So a file that was never packaged, or a feature that only
+# resolves inside a workspace, still fails the build.
+run = "cargo publish --dry-run --allow-dirty"
+
+# ---------------------------------------------------------------- the aggregate
+
+[tasks.ci]
+description = "Run every gate CI runs on a pull request, except the other toolchains"
+depends = ["fmt-check", "deps", "clippy", "test", "doc", "examples", "package"]
+run = "echo 'all gates passed'"
+
+# ---------------------------------------------------------------- release
+
+[tasks."release-check"]
+description = "Refuse to publish unless the version, the tag, and the tree agree"
+# A publish cannot be undone. Yank is the only correction, and a yanked
+# version still resolves for anyone who pinned it. So this task stops the two
+# cheap mistakes: a tag that does not match the manifest, and a version number
+# that describes code nobody committed.
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+if [ -z "$version" ]; then
+    echo "no version key in Cargo.toml" >&2
+    exit 1
+fi
+
+# On a tag push, GitHub supplies the ref name. Locally, fall back to the tag
+# that sits exactly on HEAD. The task then answers the same question either
+# way.
+tag="${GITHUB_REF_NAME:-}"
+if [ -z "$tag" ]; then
+    tag=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+fi
+
+if [ "$tag" != "v$version" ]; then
+    echo "refusing to publish: ref is '${tag:-<no tag on HEAD>}', Cargo.toml says v$version" >&2
+    exit 1
+fi
+
+if ! git diff --quiet --ignore-submodules HEAD || ! git diff --cached --quiet; then
+    echo "refusing to publish: uncommitted changes to tracked files" >&2
+    git status --short >&2
+    exit 1
+fi
+
+echo "ready to publish $version from $tag"
+'''
+
+[tasks.publish]
+description = "Upload to crates.io after the gates and the tag check"
+# The two prerequisites are dependencies, not steps in a workflow. A person
+# in a hurry cannot then run the upload out of order. Set
+# CARGO_REGISTRY_TOKEN in the environment.
+depends = ["ci", "release-check"]
+run = "cargo publish --locked"
+
+# ---------------------------------------------------------------- coverage
+#
+# These tasks need `cargo-llvm-cov` on PATH and the `llvm-tools` component,
+# which `rust-toolchain.toml` already asks for. CI installs the binary with an
+# action. Do not declare the tool here: `mise install` would then build it
+# from source on every fresh runner.
+
+[tasks.coverage]
+description = "Summarize test coverage"
+run = "cargo llvm-cov"
+
+[tasks."generate-lcov"]
+description = "Write the coverage report to lcov.info for Codecov and similar tools"
+run = "cargo llvm-cov --lcov --output-path lcov.info"
+
+# -------------------------------------------------------- conventional commits
+
+[tasks."commit-msg"]
+description = "Prevent commits with nonconformant messages."
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+msg_file="${1:-}"
+if [ -z "$msg_file" ]; then
+    echo "commit-msg: expected the commit message file as \$1" >&2
+    echo "commit-msg: this task belongs in the commit-msg hook" >&2
+    exit 1
+fi
+
+# The file holds comment lines, and with commit.verbose it holds a diff too.
+# Only the first line, the subject, carries the type.
+subject=$(head -n 1 "$msg_file")
+
+# Git writes these subjects itself. Checking them would only block merges,
+# reverts, and fixups the author never typed by hand.
+if [[ "$subject" =~ ^(Merge[[:space:]](branch|remote-tracking[[:space:]]branch|pull[[:space:]]request|commit)[[:space:]]|Revert[[:space:]]\"|fixup!|squash!) ]]; then
+    exit 0
+fi
+
+# One anchored pattern. The old pattern put `^` inside the alternation, so it
+# anchored `build` alone. A bare word such as `chore` anywhere on any line of
+# the message counted as a conformant commit.
+#
+# The shape matches .github/workflows/conventional-commits.yml: an optional
+# scope, an optional `!` for a breaking change, and a description that starts
+# with a lowercase letter (or acronym). The type list stays the one named in the
+# message below, so it lacks the `registry` and `security` types that workflow
+# allows in a pull request title. That is a choice, not an oversight: those two
+# name a repository's role, not a change to this crate.
+pattern='^(chore|ci|docs|feat|fix|perf|refactor|registry|revert|security|style|test)(\([[:alnum:]][[:alnum:]./_-]*(, ?[[:alnum:]][[:alnum:]./_-]*)*\))?!?: ([[:lower:]]|[[:upper:]][[:upper:][:digit:]]).*$'
+
+if [[ ! "$subject" =~ $pattern ]]; then
+    printf '%s\n' "$subject"
+    echo "
+Your commit message doesn't conform to Conventional Commit Rules (https://www.conventionalcommits.org/).
+The subject line must read <type>[optional scope][optional !]: <description>.
+
+Allowed types:
+
+build: chore: ci: docs: feat: fix: perf: refactor: revert: style: test:
+
+Example commit message to add a feature: 'feat: changed something to add a lovely new feature'
+Example commit message to fix an issue: 'fix: removed infinite loop causing that annoying bug'
+"
+    exit 1
+fi
+'''
+
+# ---------------------------------------------------------------- git hooks
+#
+# Git does not version `.git/hooks`, so a clone arrives with no hooks at all.
+# The `[hooks]` table at the end of this file closes that gap: mise writes the
+# hook that runs the `commit-msg` task above.
+
+[tasks."install-hooks"]
+description = "Install the commit-msg git hook from this file"
+# The task runs on every `mise install`, and again on every directory entry
+# through the `enter` hook below. Without `quiet` mise prints the command line
+# each time.
+quiet = true
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! gitdir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+    echo "install-hooks: not inside a git repository, skipping" >&2
+    exit 0
+fi
+
+# Ask the common git directory, not `--git-dir`. A linked worktree has its own
+# git directory, but git reads hooks from the common one. `--git-dir` would
+# point this task at a directory holding no hooks, and it would rewrite the hook
+# on every entry into a worktree.
+hook="$gitdir/hooks/commit-msg"
+if [ -x "$hook" ] && grep -qF 'mise run commit-msg' "$hook"; then
+    exit 0
+fi
+
+# `--hook=commit-msg` is not decoration. The default writes a pre-commit hook,
+# and git runs `pre-commit` with no arguments, so the task's $1, the message
+# file, would be empty. See the note on the task above.
+#
+# `--write` keeps a hook it did not generate by moving it to `commit-msg.old`.
+# The guard above is what stops those backups from accumulating.
+exec mise generate git-pre-commit --write --task=commit-msg --hook=commit-msg
+'''
+
+# --------------------------------------------------------------- mise hooks
+#
+# These fire from the config file, so a fresh clone already runs them. A
+# colleague needs no step beyond loading this project.
+#
+# `postinstall` runs on `mise install`. It runs even when every tool is already
+# installed, and even when this file declares no tools at all. Checked on mise
+# 2026.10.3, because a task that only fires on the first install would help one
+# person and no one after.
+#
+# `enter` covers the colleagues who never type `mise install`, because direnv or
+# `mise activate` loads the project when they cd into it. It fires on each
+# entry, which is why `install-hooks` costs nothing once the hook sits in place.
+# It needs an activated shell: `mise run` on its own does not fire it.
+[hooks]
+postinstall = ["mise run install-hooks"]
+enter = ["mise run install-hooks"]

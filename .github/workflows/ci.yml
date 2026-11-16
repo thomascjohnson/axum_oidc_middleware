@@ -1,0 +1,110 @@
+# This file has no cargo commands.
+#
+# Every job calls `mise run <task>`, and `mise.toml` holds those tasks. A
+# contributor and CI then run the same thing. A workflow that repeats cargo
+# commands drifts away from what people run, and it drifts within a month. A
+# contributor finds the drift. Their pre-commit hooks differ from a job that
+# somebody edited once and never revisited.
+#
+# This file does not install Rust. `rust-toolchain.toml` pins it, and rustup
+# on the runner reads that file as soon as cargo runs in the checkout. Put a
+# toolchain in both places and you own two sources of truth. They disagree the
+# first time somebody updates one of them.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+# A pull request from a fork gets read-only tokens anyway. State the guarantee
+# here, so it does not depend on repository defaults.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # CI builds a checked-out tree once. The incremental cache then costs write
+  # time and cache space, and saves nothing.
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  gates:
+    name: gates (pinned toolchain)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      # Install mise from a pinned release and run `mise install`. Nothing
+      # needs installing today, because rustup supplies the toolchain. The
+      # action also loads the environment from `mise.toml`. That is what makes
+      # `mise run` behave here the same way it behaves on a laptop.
+      - uses: jdx/mise-action@v5
+
+      - uses: Swatinem/rust-cache@v2.9.3
+
+      # This runs fmt-check, deps, clippy, test, doc, examples, and package.
+      # Keep it in one job, not six. Those steps then share one `target/`, and
+      # the dependency graph compiles once instead of six times.
+      - run: mise run ci
+
+  msrv:
+    name: minimum supported Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          # A different compiler invalidates the build cache in a way the
+          # default key does not record. Key it by job as well.
+          key: msrv
+      - run: mise run msrv
+
+  platforms:
+    name: tests on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      # A breakage on one platform should not hide the state of the others.
+      # These tests bind loopback sockets, and that is where platforms differ.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+      - uses: Swatinem/rust-cache@v2.9.3
+      # Run `test`, not `ci`. rustfmt, rustdoc flags, and packaging do not
+      # depend on the platform. The doctests and the examples do.
+      - run: mise run test
+
+  coverage:
+    # This job gives information, and nothing depends on it. There is no
+    # threshold to miss. A failure in the coverage tool must not look like a
+    # failure in correctness to someone who reads a red mark.
+    name: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+
+      # Install a prebuilt binary from GitHub Releases. Declaring the tool in
+      # `mise.toml` instead makes every fresh runner compile it from source.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2.9.3
+      - run: mise run coverage
