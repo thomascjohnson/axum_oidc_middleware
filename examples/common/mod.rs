@@ -24,10 +24,9 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use rand::rngs::OsRng;
+use rsa::PrivateKey;
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use rsa::traits::PublicKeyParts;
-use rsa::{BigUint, RsaPrivateKey};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -56,8 +55,8 @@ impl SigningKey {
     /// 2048 rather than 4096 because these examples run in CI on every push,
     /// and key generation dominates their wall-clock time.
     pub fn generate() -> Self {
-        let mut rng = OsRng;
-        let private = RsaPrivateKey::new(&mut rng, KEY_BITS)
+        let mut rng = rand::rng();
+        let private = PrivateKey::new(&mut rng, KEY_BITS)
             .expect("the OS provides enough randomness for a 2048-bit RSA key");
         let public = private.to_public_key();
         let private_pem = private
@@ -68,14 +67,14 @@ impl SigningKey {
 
         // `n` and `e` are base64url without padding, which is the JOSE
         // convention rather than the PEM one, so it is worth stating once here.
-        let encode_part = |value: &BigUint| URL_SAFE_NO_PAD.encode(value.to_bytes_be());
+        let encode_part = |value: &[u8]| URL_SAFE_NO_PAD.encode(value);
         let jwk = json!({
             "kty": "RSA",
             "use": "sig",
             "alg": "RS256",
             "kid": KID,
-            "n": encode_part(public.n()),
-            "e": encode_part(public.e()),
+            "n": encode_part(&public.n_bytes()),
+            "e": encode_part(&public.e_bytes()),
         });
 
         Self { private_pem, jwk }

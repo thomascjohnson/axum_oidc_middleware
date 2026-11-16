@@ -19,7 +19,7 @@
 //! still the only thing that picks an algorithm, EC is still opt-in, and RS256
 //! is still the default.
 //!
-//! The third half is the bug these tests found. `jsonwebtoken` 11.1 rejects a
+//! The third half is the bug these tests found. `jsonwebtoken` 12 rejects a
 //! token unless every algorithm in `Validation::algorithms` belongs to the
 //! family of the verifying key. So one `algorithms` list of `[RS256, ES256]`
 //! rejected *every* token from a realm publishing both key types. A realm
@@ -119,8 +119,12 @@ fn hs256_with_secret(kid: &str, claims: &serde_json::Value) -> String {
     header.kid = Some(kid.to_owned());
     header.typ = Some("JWT".to_owned());
 
-    jsonwebtoken::encode(&header, claims, &EncodingKey::from_secret(SECRET))
-        .expect("encode an HMAC token")
+    jsonwebtoken::encode(
+        &header,
+        claims,
+        &EncodingKey::from_secret(SECRET).expect("an HMAC key from the shared secret"),
+    )
+    .expect("encode an HMAC token")
 }
 
 /// The signature segment of a compact JWS, to re-attach one to a payload that
@@ -414,7 +418,7 @@ async fn an_ec_key_on_a_curve_no_accepted_algorithm_can_use_is_skipped() {
 
 #[tokio::test]
 async fn a_short_ed25519_jwk_is_refused_instead_of_crashing() {
-    // jsonwebtoken 11.1's EdDSA verifier reads the key as `&bytes[..32]`, which
+    // jsonwebtoken 12's EdDSA verifier reads the key as `&bytes[..32]`, which
     // panics on a short slice. Remove the length gate from `convert_key` and
     // this test does not fail softly. It panics on the request path, inside
     // `decode`, for whichever token names that `kid`. A provider bug must not
@@ -506,7 +510,7 @@ async fn a_realm_rotating_from_rsa_to_ec_keeps_working() {
 
 // ── One realm, several key families ──────────────────────────────────────────
 //
-// `jsonwebtoken` 11.1 requires every entry of `Validation::algorithms` to belong
+// `jsonwebtoken` 12 requires every entry of `Validation::algorithms` to belong
 // to the family of the key doing the verifying. So an issuer with both an RSA
 // and an EC key cannot be served by one algorithm list. The verifier hands
 // `decode` `configured ∩ family(selected key)`. These are the tests for both

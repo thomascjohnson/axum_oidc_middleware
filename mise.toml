@@ -99,23 +99,24 @@ cargo +"$msrv" test
 #
 # A `-Z minimal-versions` job answers a question the `msrv` job cannot: does the
 # crate build when cargo picks the oldest version each range allows? This
-# repository has no such job, and cannot have one today.
+# repository has no such job, and the reason it first gave is now gone.
 #
-# `cargo +nightly -Z minimal-versions check --lib` fails inside `num-bigint
-# 0.4.0`, and that is not code from this crate. `jsonwebtoken 11.1` names
-# `simple_asn1 0.6.0`, and that release resolves `num-bigint 0.4.0`. One call in
-# it now binds the inherent `u64::div_ceil` instead of the trait method, so the
-# file does not compile. The chain is a regular dependency. Deleting
-# `[dev-dependencies]` changes nothing.
+# Until `jsonwebtoken` 12, that command failed inside `num-bigint 0.4.0`, and
+# that is not code from this crate. `jsonwebtoken 11.1` names `simple_asn1
+# 0.6.0`, and that release resolves `num-bigint 0.4.0`. One call in it binds the
+# inherent `u64::div_ceil` instead of the trait method, so the file does not
+# compile. The chain is a regular dependency. Deleting `[dev-dependencies]`
+# changes nothing. Forcing it green meant a `num-bigint` floor in
+# `[dependencies]`, which ships a dependency the library never uses.
 #
-# The two ways to force the job green both cost more than they return. Add a
-# floor for `num-bigint` to `[dependencies]`, and the published library ships a
-# dependency it never uses, solely to satisfy one CI mode. Or wait for upstream.
-# This file waits. Re-run the command above when `jsonwebtoken` moves.
+# `cargo +nightly -Z minimal-versions check --lib` now passes. The resolution
+# picks `simple_asn1 0.6.4` and `num-bigint 0.4.8`, and both compile. The job is
+# still absent because it needs a nightly toolchain and nothing in CI installs
+# one. Adding it is a separate decision, not a blocked one.
 #
-# No downstream user is broken by this. Cargo picks the newest version inside a
-# caret range, so an ordinary build never resolves `num-bigint 0.4.0`. The
-# absent job is a missing check, not a reported bug.
+# No downstream user is broken by the old failure. Cargo picks the newest version
+# inside a caret range, so an ordinary build never resolves `num-bigint 0.4.0`.
+# The absent job is a missing check, not a reported bug.
 
 # ---------------------------------------------------------------- dependency graph
 

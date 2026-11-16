@@ -806,7 +806,7 @@ impl JwksRegistry {
             return None;
         }
 
-        // `EdDSAVerifier::new` in jsonwebtoken 11.1 reads the key as
+        // `EdDSAVerifier::new` in jsonwebtoken 12 reads the key as
         // `&bytes[..32]`, which panics on a short slice. A JWKS entry with a
         // five-byte `x` would therefore crash whichever request named that
         // `kid`, inside `decode`, on the authentication path. That would be a

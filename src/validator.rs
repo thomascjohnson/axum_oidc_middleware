@@ -2,7 +2,7 @@
 //!
 //! # The algorithm set is per key, not per authenticator
 //!
-//! `jsonwebtoken` 11.1 does not tolerate an `algorithms` list that spans key
+//! `jsonwebtoken` 12 does not tolerate an `algorithms` list that spans key
 //! families. [`verify_signature_body`] rejects a token unless *every*
 //! algorithm in `Validation::algorithms` shares the family of the token's own
 //! `alg`. That verifier, built from `alg` plus the selected key, is already
@@ -25,7 +25,7 @@
 //! never where an algorithm becomes *chosen*, only where the impossible ones
 //! drop out.
 //!
-//! [`verify_signature_body`]: https://docs.rs/jsonwebtoken/11.1.0/src/jsonwebtoken/decoding.rs.html
+//! [`verify_signature_body`]: https://docs.rs/jsonwebtoken/12.0.0/src/jsonwebtoken/decoding.rs.html
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -288,20 +288,27 @@ impl Authenticator {
         // recipient MUST understand, and "the JWS MUST be rejected" if any of
         // them are not. This verifier implements no extensions. It has no
         // decompression, no claim constraints, and no per-recipient keys, so
-        // any non-empty `crit` names something it cannot honour.
+        // any `crit` value names something it cannot honour, and an empty one
+        // declares a demand it never fills.
         //
         // What is deliberately NOT rejected here is an unrecognised header that
         // is not listed in `crit`. §4 is explicit that unknown members MUST be
         // ignored, and rejecting them would break interop with every IdP that
         // adds a private parameter. `crit` is the sole switch that turns
-        // "ignore me" into "refuse me", and it is the one `jsonwebtoken` does
-        // not throw. `jsonwebtoken` exposes the field but enforces nothing, and
-        // every default verifier leaves it unread. An issuer that set it to
-        // require a tenant-isolation gate this server does not have would
-        // otherwise receive a successful verification.
-        if let Some(critical) = header.crit.as_deref()
-            && !critical.is_empty()
-        {
+        // "ignore me" into "refuse me". An issuer that set it to require a
+        // tenant-isolation gate this server does not have would otherwise
+        // receive a successful verification.
+        //
+        // `jsonwebtoken` 12 checks `crit` inside `decode` and refuses an empty
+        // list there. That check runs after this one, and its reason names
+        // nothing. The crate therefore keeps its own rule, so the messages below
+        // stay specific whatever upstream decides next.
+        if let Some(critical) = header.crit.as_deref() {
+            if critical.is_empty() {
+                return Err(AuthError::InvalidToken(
+                    "token has an empty `crit` header".into(),
+                ));
+            }
             return Err(AuthError::InvalidToken(format!(
                 "token requires unhandled critical header(s): {}",
                 // Bounded because the crate reads `crit` from an unverified
@@ -437,7 +444,7 @@ impl Authenticator {
 /// One `Validation` per key family, each naming only the configured
 /// algorithms of that family.
 ///
-/// The constraint this exists for is `jsonwebtoken` 11.1's
+/// The constraint this exists for is `jsonwebtoken` 12's
 /// `verify_signature_body`. It rejects a token unless *every* algorithm in
 /// `Validation::algorithms` shares the family of the verifier in the call. That
 /// verifier comes from the token's `alg`, and its constructor already refuses a
@@ -1052,22 +1059,22 @@ mod tests {
     fn a_signature_from_an_untrusted_issuer_is_named_as_an_issuer_problem() {
         use base64::Engine as _;
         use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use rsa::PrivateKey;
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
         use rsa::traits::PublicKeyParts;
-        use rsa::{BigUint, RsaPrivateKey};
 
-        let private =
-            RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).expect("generate an RSA key");
+        let private = PrivateKey::new(&mut rand::rng(), 2048).expect("generate an RSA key");
         let public = private.to_public_key();
         let pem = private
             .to_pkcs8_pem(LineEnding::LF)
             .expect("serialise the private key to PKCS#8 PEM");
-        let encode = |value: &BigUint| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value.to_bytes_be())
-        };
+        let encode = |value: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(value);
 
-        let key = DecodingKey::from_rsa_components(&encode(public.n()), &encode(public.e()))
-            .expect("an RSA decoding key from its own components");
+        let key = DecodingKey::from_rsa_components(
+            &encode(&public.n_bytes()),
+            &encode(&public.e_bytes()),
+        )
+        .expect("an RSA decoding key from its own components");
 
         let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
         let registry = JwksRegistry::new(

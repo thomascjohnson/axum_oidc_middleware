@@ -20,13 +20,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use jsonwebtoken::{EncodingKey, Header};
 use p256::ecdsa::SigningKey as P256SigningKey;
+use p256::elliptic_curve::Generate as _;
 use p384::ecdsa::SigningKey as P384SigningKey;
-use rand::rngs::OsRng;
 // `rsa`, `p256` and `p384` all re-export the same `pkcs8` traits, so one set of
 // imports serialises every key type here.
+use rsa::PrivateKey;
 use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 use rsa::traits::PublicKeyParts;
-use rsa::{BigUint, RsaPrivateKey};
 
 /// Test keys are 2048-bit. Generation takes a fraction of a second, and every
 /// test below shares one key except where rotation is the subject.
@@ -80,22 +80,24 @@ impl TestKey {
     /// Generate a fresh RSA key pair. This is the shape every existing test
     /// signs with.
     pub fn generate(kid: &str) -> Self {
-        let mut rng = OsRng;
-        let private = RsaPrivateKey::new(&mut rng, KEY_BITS).expect("generate an RSA key");
+        let mut rng = rand::rng();
+        let private = PrivateKey::new(&mut rng, KEY_BITS).expect("generate an RSA key");
         let public = private.to_public_key();
 
         let pem = private
             .to_pkcs8_pem(LineEnding::LF)
             .expect("serialise the private key to PKCS#8 PEM");
 
-        let encode = |value: &BigUint| URL_SAFE_NO_PAD.encode(value.to_bytes_be());
+        // `n_bytes` and `e_bytes` return the big-endian bytes a JWK wants, so
+        // this code names no big-integer type.
+        let encode = |value: &[u8]| URL_SAFE_NO_PAD.encode(value);
 
         Self {
             kid: kid.to_owned(),
             material: Material::Rsa {
                 private_pem: pem.as_bytes().to_vec(),
-                n: encode(public.n()),
-                e: encode(public.e()),
+                n: encode(&public.n_bytes()),
+                e: encode(&public.e_bytes()),
                 public: public
                     .to_public_key_der()
                     .expect("serialise the public key to SPKI DER")
@@ -107,7 +109,7 @@ impl TestKey {
 
     /// Generate a P-256 key pair, for `ES256`.
     pub fn generate_es256(kid: &str) -> Self {
-        let private = P256SigningKey::random(&mut OsRng);
+        let private = P256SigningKey::generate();
         Self::ec(
             kid,
             jsonwebtoken::Algorithm::ES256,
@@ -117,13 +119,13 @@ impl TestKey {
                 .expect("serialise the private key to PKCS#8 PEM")
                 .as_bytes()
                 .to_vec(),
-            private.verifying_key().to_encoded_point(false).as_ref(),
+            private.verifying_key().to_sec1_point(false).as_ref(),
         )
     }
 
     /// Generate a P-384 key pair, for `ES384`.
     pub fn generate_es384(kid: &str) -> Self {
-        let private = P384SigningKey::random(&mut OsRng);
+        let private = P384SigningKey::generate();
         Self::ec(
             kid,
             jsonwebtoken::Algorithm::ES384,
@@ -133,7 +135,7 @@ impl TestKey {
                 .expect("serialise the private key to PKCS#8 PEM")
                 .as_bytes()
                 .to_vec(),
-            private.verifying_key().to_encoded_point(false).as_ref(),
+            private.verifying_key().to_sec1_point(false).as_ref(),
         )
     }
 
@@ -142,7 +144,7 @@ impl TestKey {
     ///
     /// The point is split by hand rather than asked for `x`/`y`. The accessors
     /// return `Option` because a compressed point has no `y`. Every point here
-    /// came from `to_encoded_point(false)`, so the format is known:
+    /// came from `to_sec1_point(false)`, so the format is known:
     /// `0x04 || x || y`, two field-sized halves. That is RFC 5480 §2.2, and the
     /// same bytes RFC 7518 §6.2 base64url-encodes into `x` and `y`.
     fn ec(
@@ -175,7 +177,7 @@ impl TestKey {
 
     /// Generate an Ed25519 key pair, for `EdDSA`.
     pub fn generate_ed25519(kid: &str) -> Self {
-        let private = Ed25519SigningKey::generate(&mut OsRng);
+        let private = Ed25519SigningKey::generate(&mut rand::rng());
         let public = private.verifying_key().as_bytes().to_vec();
 
         Self {
@@ -306,7 +308,8 @@ impl TestKey {
             return jsonwebtoken::encode(
                 &header,
                 claims,
-                &EncodingKey::from_secret(self.private_pem()),
+                &EncodingKey::from_secret(self.private_pem())
+                    .expect("an HMAC key from these bytes"),
             )
             .expect("encode a token");
         }
@@ -375,7 +378,8 @@ impl TestKey {
         jsonwebtoken::encode(
             &header,
             claims,
-            &EncodingKey::from_secret(self.public_bytes()),
+            &EncodingKey::from_secret(self.public_bytes())
+                .expect("an HMAC key from the public key bytes"),
         )
         .expect("encode the forged token")
     }

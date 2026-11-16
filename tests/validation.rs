@@ -1045,11 +1045,12 @@ async fn an_unknown_but_non_critical_header_parameter_is_still_accepted() {
     assert_eq!(claims.sub, "user-123");
 }
 
-/// `crit: []` lists nothing, so nothing has to be understood. Rejecting it
-/// would invent a rule the RFC does not state, and some encoders emit it for a
-/// token carrying only registered members.
+/// An empty `crit` array declares a critical demand and names no header to
+/// honour it. `jsonwebtoken` 12 refuses it inside `decode`. This crate refuses
+/// it one step earlier, so the reason names `crit` instead of reporting a bare
+/// validation failure.
 #[tokio::test]
-async fn an_empty_crit_array_is_not_a_demand() {
+async fn an_empty_crit_array_is_refused_by_name() {
     let key = TestKey::generate("k1");
     let h = Harness::start(std::slice::from_ref(&key)).await;
 
@@ -1058,9 +1059,14 @@ async fn an_empty_crit_array_is_not_a_demand() {
         serde_json::json!({ "crit": [] }),
     );
 
+    let err = h
+        .auth
+        .authenticate(&empty_crit)
+        .await
+        .expect_err("a `crit` that names nothing is a malformed critical header");
     assert!(
-        h.auth.authenticate(&empty_crit).await.is_ok(),
-        "an empty `crit` demands nothing, so it cannot refuse anything"
+        err.to_string().contains("empty `crit`"),
+        "the refusal must name the header that caused it: {err}"
     );
 }
 
