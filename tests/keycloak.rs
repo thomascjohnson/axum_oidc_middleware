@@ -21,7 +21,8 @@ const API_AUDIENCE: &str = "myaudience";
 const KEYCLOAK_DEFAULT_AUD: &str = "account";
 const CLIENT: &str = "my-client";
 
-/// Issuer, audiences, and authorised parties, all configurable.
+/// Issuer, audiences, and authorised parties, all configurable. All three land
+/// on the one issuer, which is the only place either set can be stated.
 async fn verifier(
     key: &TestKey,
     audiences: &[&str],
@@ -29,21 +30,23 @@ async fn verifier(
 ) -> (StubIssuer, Authenticator) {
     let stub = StubIssuer::start_local(std::slice::from_ref(key)).await;
 
+    // The audiences go in as the constructor's required set, since this suite
+    // varies them per test. `azp` is folded on afterwards because it is the
+    // optional half — the empty slice has to stay empty, which is this crate's
+    // "do not gate" for this issuer.
+    let issuer = Issuer::discover(stub.iss(), audiences.iter().copied()).expect("valid issuer");
+    let issuer = authorized_parties
+        .iter()
+        .fold(issuer, |issuer, party| issuer.authorized_party(*party));
+
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(stub.iss()).expect("valid issuer"))
-        .with_authorized_parties(authorized_parties.iter().copied())
+        .with_issuer(issuer)
         .with_insecure_http(true)
         .with_policy(CachePolicy {
             min_fetch_gap: Duration::from_secs(1),
             timeout: Duration::from_secs(2),
             ..CachePolicy::default()
         });
-    // `fold` rather than a literal list: the ceiling is the one flat audience
-    // set, and this suite varies it per test. One issuer, so it inherits that
-    // whole ceiling — `azp`, not the audience layer, is what is under test.
-    let config = audiences
-        .iter()
-        .fold(config, |config, aud| config.with_audience(*aud));
 
     let auth = Authenticator::start(config)
         .await
@@ -103,7 +106,7 @@ async fn naming_the_api_as_the_audience_locks_out_a_stock_keycloak() {
 
     assert!(matches!(err, AuthError::InvalidToken(_)), "{err:?}");
     assert!(
-        auth.authorized_parties().is_empty(),
+        auth.all_authorized_parties().is_empty(),
         "azp is not checked unless configured"
     );
 }
@@ -274,18 +277,19 @@ async fn azp_does_not_weaken_the_issuer_check() {
         auth.authenticate(&token).await.is_err(),
         "a foreign issuer is refused regardless of a valid azp"
     );
-    assert_eq!(auth.audiences(), vec![KEYCLOAK_DEFAULT_AUD.to_owned()]);
+    assert_eq!(auth.all_audiences(), vec![KEYCLOAK_DEFAULT_AUD.to_owned()]);
     drop(stub);
 }
 
 #[tokio::test]
 async fn an_empty_authorised_party_is_a_configuration_error() {
-    // `--azp ""` would be a check that can never pass: an outage dressed up as
-    // a security control, and quiet about it.
-    let bad = AuthConfig::empty()
-        .with_issuer(Issuer::discover("https://identity.example").expect("valid issuer"))
-        .with_authorized_parties([String::new()])
-        .with_audience(API_AUDIENCE);
+    let bad = AuthConfig::empty().with_issuer(
+        Issuer::discover("https://identity.example", [API_AUDIENCE])
+            .expect("valid issuer")
+            // `--azp ""` would be a check that can never pass: an outage dressed
+            // up as a security control, and quiet about it.
+            .authorized_party(String::new()),
+    );
 
     assert!(
         matches!(
@@ -300,9 +304,11 @@ async fn an_empty_authorised_party_is_a_configuration_error() {
     // because this test is about the empty state itself. The default from
     // `empty()` and an operator's "no clients restricted" must be the same
     // config.
-    let fine = AuthConfig::empty()
-        .with_issuer(Issuer::discover("https://identity.example").expect("valid issuer"))
-        .with_authorized_parties(Vec::<String>::new())
-        .with_audience(API_AUDIENCE);
+    let fine = AuthConfig::empty().with_issuer(
+        // An empty `authorized_parties` and never calling
+        // `authorized_party` must be the same config, and that config must
+        // boot.
+        Issuer::discover("https://identity.example", [API_AUDIENCE]).expect("valid issuer"),
+    );
     assert!(fine.validate().is_ok(), "no azp configured is fine");
 }

@@ -26,13 +26,12 @@ async fn stub_and_config(keys: &[TestKey]) -> (StubIssuer, AuthConfig) {
     let stub = StubIssuer::start_local(keys).await;
 
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(stub.iss()).expect("valid issuer"))
+        .with_issuer(Issuer::discover(stub.iss(), [AUDIENCE]).expect("valid issuer"))
         .with_insecure_http(true)
         .with_policy(CachePolicy {
             timeout: Duration::from_secs(2),
             ..CachePolicy::default()
-        })
-        .with_audience(AUDIENCE);
+        });
 
     (stub, config)
 }

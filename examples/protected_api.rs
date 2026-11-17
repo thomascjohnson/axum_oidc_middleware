@@ -33,10 +33,12 @@ async fn main() {
     let key = SigningKey::generate();
     let issuer = MockIssuer::start(&key).await;
 
-    // Built through the chain, so there is no way to leave the audience empty.
+    // The issuer names its own audience as it is built, so there is no way to
+    // leave the audience empty and no wider list for it to inherit.
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(issuer.iss()).expect("the mock issuer's iss is a URL"))
-        .with_audience(AUDIENCE)
+        .with_issuer(
+            Issuer::discover(issuer.iss(), [AUDIENCE]).expect("the mock issuer's iss is a URL"),
+        )
         // Loopback only, and only because the mock issuer has no certificate.
         // This is the one switch in the crate that downgrades the client which
         // fetches your trust anchors. `src/http.rs` refuses `http://` without it.

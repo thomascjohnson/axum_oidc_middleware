@@ -32,14 +32,15 @@ impl TestServer {
         let iss = stub.iss();
 
         let config = axum_oidc_middleware::AuthConfig::empty()
-            .with_issuer(axum_oidc_middleware::Issuer::discover(&iss).expect("valid issuer"))
+            .with_issuer(
+                axum_oidc_middleware::Issuer::discover(&iss, [AUDIENCE]).expect("valid issuer"),
+            )
             .with_insecure_http(true)
             .with_policy(axum_oidc_middleware::CachePolicy {
                 min_fetch_gap: std::time::Duration::from_secs(1),
                 timeout: std::time::Duration::from_secs(2),
                 ..Default::default()
-            })
-            .with_audience(AUDIENCE);
+            });
 
         let auth = Authenticator::start(config)
             .await

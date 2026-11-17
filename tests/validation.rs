@@ -49,21 +49,19 @@ impl Harness {
     }
 }
 
-/// One ceiling and one audience per issuer, for every issuer in `issuers`.
+/// One audience per issuer, for every issuer in `issuers`.
 ///
-/// Each entry names its issuer explicitly. A lone issuer could inherit the
-/// ceiling, but several tests here pass two or three issuers, and that
-/// topology requires explicit names. These tests are about *issuer* trust,
-/// so each entry pins the audience layer to one constant. That constant
-/// cannot be the reason a token fails.
+/// Each entry names its own audience as it is built: there is no ceiling to
+/// inherit, so an issuer here is a complete statement of what it serves. These
+/// tests are about *issuer* trust, so the audience is one constant for all of
+/// them. That constant cannot be the reason a token fails.
 fn config(issuers: Vec<String>, jwks_url: Option<url::Url>) -> AuthConfig {
     let issuers = issuers
         .iter()
         .map(|iss| match &jwks_url {
-            Some(url) => Issuer::with_jwks_url(iss, url.clone()),
-            None => Issuer::discover(iss),
+            Some(url) => Issuer::with_jwks_url(iss, url.clone(), [AUDIENCE]),
+            None => Issuer::discover(iss, [AUDIENCE]),
         })
-        .map(|issuer| issuer.map(|issuer| issuer.audience(AUDIENCE)))
         .collect::<Result<Vec<_>, _>>()
         .expect("build issuers");
 
@@ -71,7 +69,6 @@ fn config(issuers: Vec<String>, jwks_url: Option<url::Url>) -> AuthConfig {
         .with_issuers(issuers)
         .with_policy(fast_policy())
         .with_insecure_http(true)
-        .with_audience(AUDIENCE)
 }
 
 // ── The happy path ───────────────────────────────────────────────────────────
@@ -138,7 +135,7 @@ async fn works_without_discovery_when_the_jwks_url_is_given() {
     let mut cfg = config(vec![stub.iss()], None);
     // Point straight at the keys, bypassing the discovery document entirely.
     cfg.issuers = vec![
-        Issuer::with_jwks_url(stub.iss(), stub.jwks_url())
+        Issuer::with_jwks_url(stub.iss(), stub.jwks_url(), [AUDIENCE])
             .expect("build an issuer from a JWKS URL"),
     ];
 
@@ -290,46 +287,47 @@ async fn rejects_a_token_with_no_audience_at_all() {
 
 #[test]
 fn refusing_to_name_an_audience_is_a_configuration_error() {
-    // The default must never turn audience verification off. If an operator
-    // forgets the flag, the process must not start.
-    let empty = AuthConfig::empty()
-        .with_issuer(Issuer::discover("https://identity.example").expect("valid issuer"))
-        .with_insecure_http(false);
-    let err = empty
-        .validate()
+    // The default must never turn audience verification off. An issuer that
+    // names no audience is refused where it is built: there is no
+    // deployment-wide list for it to inherit, so an empty set has no reading
+    // other than "anything".
+    let err = Issuer::discover("https://identity.example", Vec::<String>::new())
         .expect_err("no audience is not a valid configuration");
     assert!(matches!(err, AuthError::Configuration(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("https://identity.example"),
+        "the message must name the issuer that said nothing, not just say that \
+         some audience is missing: {err}"
+    );
 
-    // An empty string is not an audience either.
+    // An empty string is not an audience either, and that one is only visible
+    // to `validate`: the set is non-empty, so the constructor has nothing to
+    // object to.
     let blank = AuthConfig::empty()
-        .with_issuer(Issuer::discover("https://identity.example").expect("valid issuer"))
-        .with_insecure_http(false)
-        .with_audience(String::new());
+        .with_issuer(Issuer::discover("https://identity.example", [""]).expect("valid issuer"))
+        .with_insecure_http(false);
     assert!(blank.validate().is_err(), "an empty audience is rejected");
 }
 
 #[test]
-fn an_issuer_audience_outside_the_ceiling_is_a_configuration_error() {
-    // The per-issuer list narrows the global one and cannot widen it. Left as
-    // a silent intersection this would be a caller that can never be
-    // authenticated. At boot it is one error message.
-    let config = AuthConfig::empty()
-        .with_issuer(
-            Issuer::discover("https://identity.example")
-                .expect("valid issuer")
-                .audience("not-in-the-ceiling"),
-        )
-        .with_audience("my-audience");
+fn a_lone_issuer_naming_no_audience_is_a_configuration_error() {
+    // Used to be legal: with one issuer, an unspecified audience list meant
+    // "whatever the deployment served". There is no deployment list to mean
+    // that, so an empty list here has no reading except "anything", which is
+    // the one thing this crate refuses to accept. It is refused for the only
+    // issuer exactly as it is for the second one, and now at the same place: a
+    // lone issuer naming nothing is a failed constructor, not a failed boot.
+    let err = Issuer::discover("https://identity.example/realms/solo", Vec::<String>::new())
+        .expect_err("naming no audience is not an issuer");
 
     assert!(
         matches!(
-            config.validate(),
-            Err(AuthError::Configuration(reason))
-                if reason.contains("not-in-the-ceiling")
-                    && reason.contains("ceiling")
+            err,
+            AuthError::Configuration(ref reason)
+                if reason.contains("names no audiences")
+                    && reason.contains("https://identity.example/realms/solo")
         ),
-        "{}",
-        config.validate().expect_err("the config is invalid")
+        "{err:?}"
     );
 }
 
@@ -684,8 +682,9 @@ async fn an_issuer_publishing_only_unusable_keys_refuses_to_start() {
     let stub = StubIssuer::start("https://identity.example", std::slice::from_ref(&key)).await;
 
     let mut cfg = config(vec![stub.iss()], Some(stub.jwks_url()));
-    cfg.issuers =
-        vec![Issuer::with_jwks_url(stub.iss(), stub.jwks_url()).expect("build an issuer")];
+    cfg.issuers = vec![
+        Issuer::with_jwks_url(stub.iss(), stub.jwks_url(), [AUDIENCE]).expect("build an issuer"),
+    ];
 
     stub.publish(vec![key.jwk_with_kty("EC")]);
 
@@ -1104,29 +1103,31 @@ async fn a_flood_of_audiences_produces_a_bounded_refusal() {
     let stub = StubIssuer::start_local(std::slice::from_ref(&key)).await;
     let iss = stub.iss();
 
-    // Ceiling admits both. This issuer is trusted for only one. So a token
-    // bearing the other clears jsonwebtoken's own gate. It then lands on the
-    // per-issuer narrowing, which is where the refusal and the message come
-    // from.
-    let issuer = Issuer::discover(&iss)
-        .expect("issuer")
-        .audience("my-audience");
+    // Some *other* issuer is trusted for `other-api`, which puts it in the union
+    // that `jsonwebtoken` checks. This issuer is trusted for only one audience,
+    // so a token bearing the other clears that first gate and lands on the
+    // per-issuer set, which is where the refusal and the message come from.
+    // Name `other-api` nowhere and the first gate refuses the token instead,
+    // and this test measures the wrong refusal.
+    let other_key = TestKey::generate("k2");
+    let other_stub = StubIssuer::start_local(std::slice::from_ref(&other_key)).await;
+
     let auth = Authenticator::start(
         AuthConfig::empty()
-            .with_issuers(vec![issuer])
-            .with_audience("my-audience")
-            .with_audience("other-api")
+            .with_issuers([
+                Issuer::discover(&iss, ["my-audience"]).expect("issuer"),
+                Issuer::discover(other_stub.iss(), ["other-api"]).expect("the other issuer"),
+            ])
             .with_policy(fast_policy())
             .with_insecure_http(true),
     )
     .await
     .expect("start");
 
-    // Must *include* `other-api`: that is in the ceiling but not this issuer's
-    // own set. That is what carries the token past jsonwebtoken's ceiling rule
-    // and onto the per-issuer narrowing where this message is built. A flood of
-    // only unknown audiences never reaches that far — jsonwebtoken refuses it
-    // first.
+    // Must *include* `other-api`: that is in the union but not this issuer's own
+    // set. That is what carries the token past jsonwebtoken's union rule and onto
+    // the per-issuer set where this message is built. A flood of only unknown
+    // audiences never reaches that far — jsonwebtoken refuses it first.
     let mut claims = key.claims(&iss, "other-api");
     let mut flooded: Vec<String> = (0..499)
         .map(|n| format!("resource-indicator-{n:0>4}"))
@@ -1182,8 +1183,9 @@ async fn a_flood_of_audiences_produces_a_bounded_refusal() {
 fn a_refresh_gap_under_the_flood_floor_is_refused() {
     let config = |gap: Duration| {
         AuthConfig::empty()
-            .with_issuer(Issuer::discover("https://idp.example.com").expect("valid issuer"))
-            .with_audience(AUDIENCE)
+            .with_issuer(
+                Issuer::discover("https://idp.example.com", [AUDIENCE]).expect("valid issuer"),
+            )
             .with_policy(CachePolicy {
                 min_fetch_gap: gap,
                 ..CachePolicy::default()

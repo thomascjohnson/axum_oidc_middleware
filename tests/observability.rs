@@ -58,14 +58,15 @@ impl TestServer {
 
         let auth = Authenticator::start(
             axum_oidc_middleware::AuthConfig::empty()
-                .with_issuer(axum_oidc_middleware::Issuer::discover(&iss).expect("valid issuer"))
+                .with_issuer(
+                    axum_oidc_middleware::Issuer::discover(&iss, [AUDIENCE]).expect("valid issuer"),
+                )
                 .with_insecure_http(true)
                 .with_policy(axum_oidc_middleware::CachePolicy {
                     min_fetch_gap: Duration::from_secs(1),
                     timeout: Duration::from_secs(2),
                     ..Default::default()
-                })
-                .with_audience(AUDIENCE),
+                }),
         )
         .await
         .expect("start the authenticator");
@@ -393,9 +394,10 @@ async fn start_up_logs_which_issuer_it_loaded_and_how_many_keys_it_found() {
 
     let auth = Authenticator::start(
         axum_oidc_middleware::AuthConfig::empty()
-            .with_issuer(axum_oidc_middleware::Issuer::discover(&iss).expect("valid issuer"))
-            .with_insecure_http(true)
-            .with_audience(AUDIENCE),
+            .with_issuer(
+                axum_oidc_middleware::Issuer::discover(&iss, [AUDIENCE]).expect("valid issuer"),
+            )
+            .with_insecure_http(true),
     )
     .await
     .expect("start against the stub");

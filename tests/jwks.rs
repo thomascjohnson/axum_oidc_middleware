@@ -63,10 +63,9 @@ async fn harness(key: &TestKey, ttl: Duration) -> (StubIssuer, Authenticator, St
     let iss = stub.iss();
 
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(iss.clone()).expect("valid issuer"))
+        .with_issuer(Issuer::discover(iss.clone(), [AUDIENCE]).expect("valid issuer"))
         .with_policy(policy(ttl))
-        .with_insecure_http(true)
-        .with_audience(AUDIENCE);
+        .with_insecure_http(true);
 
     let auth = Authenticator::start(config)
         .await
@@ -585,15 +584,14 @@ async fn a_provider_hanging_past_its_budget_refuses_the_waiter_as_an_outage() {
     // irrelevant once a flight exists — it gates starting one, not joining it.
     let auth = Authenticator::start(
         AuthConfig::empty()
-            .with_issuer(Issuer::discover(iss.clone()).expect("valid issuer"))
+            .with_issuer(Issuer::discover(iss.clone(), [AUDIENCE]).expect("valid issuer"))
             .with_policy(CachePolicy {
                 ttl: Duration::from_millis(400),
                 min_fetch_gap: Duration::from_secs(1),
                 timeout: BUDGET,
                 ..CachePolicy::default()
             })
-            .with_insecure_http(true)
-            .with_audience(AUDIENCE),
+            .with_insecure_http(true),
     )
     .await
     .expect("start an authenticator against the stub issuer");

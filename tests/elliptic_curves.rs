@@ -65,7 +65,7 @@ async fn harness(published: &[serde_json::Value], algorithms: &[SignatureAlgorit
 
     let iss = stub.iss();
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(iss.clone()).expect("valid issuer"))
+        .with_issuer(Issuer::discover(iss.clone(), [AUDIENCE]).expect("valid issuer"))
         .with_algorithms(algorithms.to_vec())
         // `min_fetch_gap` at 1s rather than the 10s default, so a test whose
         // `kid` is unknown waits a second for its refresh instead of ten.
@@ -74,8 +74,7 @@ async fn harness(published: &[serde_json::Value], algorithms: &[SignatureAlgorit
             timeout: Duration::from_secs(2),
             ..CachePolicy::default()
         })
-        .with_insecure_http(true)
-        .with_audience(AUDIENCE);
+        .with_insecure_http(true);
 
     let auth = Authenticator::start(config)
         .await
@@ -348,10 +347,12 @@ async fn an_issuer_publishing_only_a_symmetric_key_refuses_to_start() {
     stub.publish(vec![oct_jwk("kid-oct")]);
 
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::with_jwks_url(stub.iss(), stub.jwks_url()).expect("build an issuer"))
+        .with_issuer(
+            Issuer::with_jwks_url(stub.iss(), stub.jwks_url(), [AUDIENCE])
+                .expect("build an issuer"),
+        )
         .with_algorithms([SignatureAlgorithm::Rs256])
-        .with_insecure_http(true)
-        .with_audience(AUDIENCE);
+        .with_insecure_http(true);
 
     let err = Authenticator::start(config)
         .await

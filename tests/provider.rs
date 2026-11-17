@@ -31,14 +31,13 @@ async fn harness(published: &[serde_json::Value]) -> (StubIssuer, Authenticator,
 
     let auth = Authenticator::start(
         AuthConfig::empty()
-            .with_issuer(Issuer::discover(iss.clone()).expect("valid issuer"))
+            .with_issuer(Issuer::discover(iss.clone(), [AUDIENCE]).expect("valid issuer"))
             .with_insecure_http(true)
             .with_policy(CachePolicy {
                 min_fetch_gap: Duration::from_secs(1),
                 timeout: Duration::from_secs(2),
                 ..CachePolicy::default()
-            })
-            .with_audience(AUDIENCE),
+            }),
     )
     .await
     .expect("start against the stub");
@@ -53,9 +52,8 @@ async fn harness_from_body(body: &str) -> (StubIssuer, AuthConfig, String) {
     let iss = stub.iss();
 
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(iss.clone()).expect("valid issuer"))
-        .with_insecure_http(true)
-        .with_audience(AUDIENCE);
+        .with_issuer(Issuer::discover(iss.clone(), [AUDIENCE]).expect("valid issuer"))
+        .with_insecure_http(true);
 
     (stub, config, iss)
 }
@@ -181,11 +179,11 @@ async fn a_jwks_truncated_mid_body_is_an_outage() {
                 Issuer::with_jwks_url(
                     &iss,
                     url::Url::parse(&format!("{iss}/jwks.json")).expect("parse a JWKS URL"),
+                    [AUDIENCE],
                 )
                 .expect("valid issuer"),
             )
-            .with_insecure_http(true)
-            .with_audience(AUDIENCE),
+            .with_insecure_http(true),
     )
     .await
     .expect_err("a body that ends mid-document is not a key set");

@@ -10,7 +10,7 @@ repository = "https://github.com/thomascjohnson/axum_oidc_middleware"
 # `documentation` is not strictly needed. This file states the link anyway, so a
 # caller sees it in the manifest instead of trusting a default.
 documentation = "https://docs.rs/axum-oidc-middleware"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -22,7 +22,7 @@ categories = [
     "network-programming",
 ]
 
-# Ship the source, the tests, the examples, and the three documents a caller
+# Ship the source, the tests, the examples, and the documents a caller
 # reads. Keep the development infrastructure out.
 #
 # `include` is a whitelist, so a stray `notes.md` or a local `.env` in the
@@ -50,6 +50,9 @@ include = [
     "/tests/**",
     "/examples/**",
     "/README.md",
+    # Ships because a caller upgrading across a breaking change needs the
+    # migration path, and a vendored copy has no crates.io page to read.
+    "/CHANGELOG.md",
     "/SECURITY.md",
     "/LICENSE",
 ]
