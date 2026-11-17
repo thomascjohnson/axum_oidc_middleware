@@ -34,8 +34,9 @@ async fn main() {
     let issuer = MockIssuer::start(&key).await;
 
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(issuer.iss()).expect("the mock issuer's iss is a URL"))
-        .with_audience(AUDIENCE)
+        .with_issuer(
+            Issuer::discover(issuer.iss(), [AUDIENCE]).expect("the mock issuer's iss is a URL"),
+        )
         .with_insecure_http(true);
     let auth = Authenticator::start(config)
         .await

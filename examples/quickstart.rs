@@ -49,24 +49,36 @@ async fn main() {
         usage();
         std::process::exit(2);
     }
+    // Read before the loop below, so the gate is either on for every issuer
+    // listed or off for all of them, and never half-built.
+    let parties: Vec<String> = env("OIDC_AZP")
+        .unwrap_or_default()
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|party| !party.is_empty())
+        .map(str::to_owned)
+        .collect();
 
-    let mut config = AuthConfig::empty().with_audience(audience.clone());
+    // Each issuer names the audience it serves, in its own constructor. There
+    // is no deployment-wide audience list for an issuer to inherit, so a new
+    // issuer cannot quietly pick up the audience meant for the others.
+    let mut config = AuthConfig::empty();
     for iss in &issuers {
-        config = config.with_issuer(Issuer::discover(iss.clone()).expect("each issuer is a URL"));
-    }
-    // Optional. In a stock Keycloak realm `aud` is "account" for every API, so
-    // this is what distinguishes two services on one realm. It narrows the
-    // audience, never replaces it.
-    if let Some(parties) = env("OIDC_AZP") {
-        let parties: Vec<String> = parties
-            .split([',', ' '])
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if !parties.is_empty() {
-            config = config.with_authorized_parties(parties);
-        }
+        let issuer =
+            Issuer::discover(iss.clone(), [audience.clone()]).expect("each issuer is a URL");
+        // Optional, and per issuer. In a stock Keycloak realm `aud` is
+        // "account" for every API, so `azp` is what distinguishes two services
+        // on one realm. It narrows the audience, never replaces it.
+        //
+        // Named here rather than on `AuthConfig` because a client id is unique
+        // within a realm, not across them. An issuer that never emits `azp` —
+        // Google does not — must be left ungated or every one of its tokens
+        // fails a claim it cannot make. Trust such an issuer alongside a
+        // Keycloak realm and only the realm gets the `authorized_party` call.
+        let issuer = parties.iter().fold(issuer, |issuer, party| {
+            issuer.authorized_party(party.clone())
+        });
+        config = config.with_issuer(issuer);
     }
 
     // No `with_insecure_http` here, and that is the point: the default rejects a

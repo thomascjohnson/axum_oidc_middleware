@@ -1,8 +1,9 @@
-//! Per-issuer audiences: which issuer is allowed to vouch for which audience.
+//! Per-issuer scope: which issuer is allowed to vouch for which audience, and
+//! which client.
 //!
-//! Before audiences were per issuer, [`AuthConfig::with_audience`] built one
-//! flat list handed to `Validation::set_audience` for every issuer at once. In
-//! a two-issuer deployment that made the audience set a property of the
+//! Audiences used to be one flat list handed to `Validation::set_audience` for
+//! every issuer at once, from [`AuthConfig`] rather than from the issuers. In a
+//! two-issuer deployment that made the audience set a property of the
 //! *verifier* rather than of the issuer that signed the token. So any trusted
 //! issuer could vouch for any audience this verifier served: issuer A's key,
 //! issuer B's `aud`, accepted. Multi-tenant, that is a token minted for one
@@ -10,28 +11,36 @@
 //! degradation and it does not log. The signature is real, the audience is
 //! real, only the pairing is one nobody chose.
 //!
-//! So `aud` is now decided in two gates in series. These tests prove that both
-//! gates are necessary and that neither one stands in for the other:
+//! So `aud` is decided in two gates in series, and `azp` is scoped the same
+//! way. These tests prove that both audience gates are necessary and that
+//! neither one stands in for the other:
 //!
-//! * the **ceiling** (`AuthConfig::audiences`), verified inside `decode` by
-//!   `jsonwebtoken`, over every token from any issuer.
-//! * the **per-issuer layer** (`Issuer::audience`), verified by
+//! * the **union** ([`AuthConfig::all_audiences`], derived from the issuers rather
+//!   than set beside them), verified inside `decode` by `jsonwebtoken`, over
+//!   every token from any issuer.
+//! * the **issuer gate** ([`Issuer::audiences()`]), verified by
 //!   [`Authenticator::authenticate`] *after* the signature, once the issuer
 //!   that actually signed is a verified fact rather than an unverified claim.
 //!
-//! A token has to clear both, so what is accepted is `ceiling ∩ layer`. The
-//! headline test therefore names an audience that *is* in the ceiling. The
-//! ceiling says yes, and only the per-issuer layer is left standing between
-//! issuer A's key and issuer B's API. Its refusal wording is asserted as well,
-//! because "refused" is not the finding. "Refused by the gate under test" is.
-//! Both gates answer `AuthError::InvalidToken`, so the variant alone cannot
+//! A token has to clear both, so what is accepted is only what the signing
+//! issuer itself named. The headline test therefore names an audience that *is*
+//! in the union. The union says yes, and only the issuer gate is left standing
+//! between issuer A's key and issuer B's API. Its refusal wording is asserted as
+//! well, because "refused" is not the finding. "Refused by the gate under test"
+//! is. Both gates answer `AuthError::InvalidToken`, so the variant alone cannot
 //! tell them apart, and a test that only verified the variant would pass with
 //! the hole wide open.
 //!
-//! The other half is that none of this moved. A lone issuer with no per-issuer
-//! list still boots and authenticates exactly as before. The layer is keyed
-//! by the *verified* issuer rather than the claimed one, so a key cannot be
-//! pointed at another issuer's narrower set by naming it.
+//! `azp` gets the same treatment for a sharper reason. A client id is unique
+//! within a realm, not across realms, so two trusted realms can each carry a
+//! client called `my-client`. A shared accepted-client list admitted either
+//! one's token — and with `aud` reading `"account"` for every API in a stock
+//! realm, the audience gates above cannot tell those tokens apart either.
+//!
+//! What did not move is the single-issuer deployment, except that it now names
+//! its audience where it always named its issuer. The issuer gate is keyed by
+//! the *verified* issuer rather than the claimed one, so a key cannot be pointed
+//! at another issuer's set by naming it.
 
 mod common;
 
@@ -43,10 +52,11 @@ use common::{StubIssuer, TestKey};
 /// What issuer A is trusted for.
 const AUD_A: &str = "my-api";
 /// What issuer B is trusted for. This is also the point of the headline test.
-/// It is in the ceiling, so a token naming it clears the global gate from
-/// *any* issuer. Only A's own list can refuse it.
+/// It is in the union, because B named it, so a token naming it clears the
+/// first gate from *any* issuer. Only A's own list can refuse it.
 const AUD_B: &str = "billing-api";
-/// In no ceiling and in no issuer's list: refused by the global gate.
+/// Named by no issuer at all, so it is not in the union: refused by the first
+/// gate, without ever reaching an issuer's own list.
 const AUD_OUTSIDE: &str = "someone-elses-api";
 
 /// The client an `azp` names, and a second one that must not be admitted by it.
@@ -57,9 +67,9 @@ const OTHER_CLIENT: &str = "reporting-client";
 /// [`Authenticator::authenticate`].
 ///
 /// Matched as a string because *which gate refused* is the finding here. Both
-/// audience gates answer `InvalidToken`. Only the layer says "is not an
+/// audience gates answer `InvalidToken`. Only the issuer gate says "is not an
 /// audience issuer `…` is trusted for". So without this, the headline tests
-/// would pass on a refusal by the ceiling. That is a different gate, and the
+/// would pass on a refusal by the union gate. That is a different gate, and the
 /// hole still open underneath.
 const PER_ISSUER_REFUSAL: &str = "is not an audience issuer";
 
@@ -77,12 +87,12 @@ struct TwoIssuers {
     auth: Authenticator,
 }
 
-/// The standard topology: ceiling `[AUD_A, AUD_B]`, A naming only `AUD_A`, B
-/// naming only `AUD_B`, `azp` unchecked.
+/// The standard topology: A naming only `AUD_A`, B naming only `AUD_B` (so the
+/// union is `[AUD_A, AUD_B]`), `azp` unchecked.
 async fn two_issuers() -> TwoIssuers {
     let key_a = TestKey::generate("kid-a");
     let key_b = TestKey::generate("kid-b");
-    issuers(key_a, key_b, &[AUD_A, AUD_B], &[AUD_A], &[AUD_B], &[]).await
+    issuers(key_a, key_b, &[AUD_A], &[AUD_B], &[], &[]).await
 }
 
 /// The same topology with both issuers publishing the *same* `kid`.
@@ -93,10 +103,10 @@ async fn two_issuers() -> TwoIssuers {
 async fn two_issuers_sharing_a_kid() -> TwoIssuers {
     let key_a = TestKey::generate("key-1");
     let key_b = TestKey::generate("key-1");
-    issuers(key_a, key_b, &[AUD_A, AUD_B], &[AUD_A], &[AUD_B], &[]).await
+    issuers(key_a, key_b, &[AUD_A], &[AUD_B], &[], &[]).await
 }
 
-/// Two issuers over an explicit ceiling, per-issuer audience lists, and `azp`s.
+/// Two issuers over per-issuer audience lists and per-issuer client lists.
 ///
 /// Every axis is a parameter because each test below differs from the standard
 /// topology on exactly one of them. A harness that differs in two no longer
@@ -105,10 +115,10 @@ async fn two_issuers_sharing_a_kid() -> TwoIssuers {
 async fn issuers(
     key_a: TestKey,
     key_b: TestKey,
-    ceiling: &[&str],
     audiences_a: &[&str],
     audiences_b: &[&str],
-    authorized_parties: &[&str],
+    parties_a: &[&str],
+    parties_b: &[&str],
 ) -> TwoIssuers {
     // Two stubs on two loopback ports: two genuinely distinct `iss` values,
     // each with its own discovery document and its own key. Sharing one stub
@@ -118,16 +128,11 @@ async fn issuers(
     let stub_b = StubIssuer::start_local(std::slice::from_ref(&key_b)).await;
     let (iss_a, iss_b) = (stub_a.iss(), stub_b.iss());
 
-    let config = ceiling
-        .iter()
-        .fold(AuthConfig::empty(), |config, aud| {
-            config.with_audience(*aud)
-        })
+    let config = AuthConfig::empty()
         .with_issuers([
-            issuer_with_audiences(&iss_a, audiences_a),
-            issuer_with_audiences(&iss_b, audiences_b),
+            issuer_scope(&iss_a, audiences_a, parties_a),
+            issuer_scope(&iss_b, audiences_b, parties_b),
         ])
-        .with_authorized_parties(authorized_parties.iter().copied())
         // 1s rather than the 10s default, so a token naming an unknown `kid`
         // waits a second for its refresh instead of ten.
         .with_policy(CachePolicy {
@@ -152,13 +157,16 @@ async fn issuers(
     }
 }
 
-/// A discovered issuer naming exactly these audiences — none, if empty, which
-/// means the whole ceiling and is only legal while it is the only issuer.
-fn issuer_with_audiences(iss: &str, audiences: &[&str]) -> Issuer {
-    let issuer = Issuer::discover(iss).expect("valid issuer");
-    audiences
+/// A discovered issuer naming exactly these audiences and these clients.
+///
+/// Both are per issuer, which is the whole subject of this file: the audience
+/// set and the client set are stated on the issuer they describe, and there is
+/// no deployment-wide version of either to narrow or to inherit.
+fn issuer_scope(iss: &str, audiences: &[&str], parties: &[&str]) -> Issuer {
+    let issuer = Issuer::discover(iss, audiences.iter().copied()).expect("valid issuer");
+    parties
         .iter()
-        .fold(issuer, |issuer, aud| issuer.audience(*aud))
+        .fold(issuer, |issuer, party| issuer.authorized_party(*party))
 }
 
 /// Claims for `iss`/`aud`, with `azp` present only when `party` names one.
@@ -208,12 +216,12 @@ async fn refusal(auth: &Authenticator, token: &str) -> AuthError {
 async fn a_token_signed_by_issuer_a_is_refused_for_issuer_bs_audience() {
     // The regression this change exists to close. Issuer A's own key signs the
     // token, correctly trusted, and names issuer B's audience. `AUD_B` *is* in
-    // the ceiling, so the global audience gate passes. Before the per-issuer
-    // layer this authenticated: the ceiling was one flat set shared by both
-    // issuers, so A's key vouched for B's API. The layer built from A's own list
-    // is the only thing standing between them now. The refusal has to say so. A
-    // refusal from the ceiling would mean this token never reached the gate
-    // under test, and the hole would still be open.
+    // the union, because B named it, so the first audience gate passes. Before
+    // audiences were per issuer this authenticated: the accepted set was one
+    // flat list shared by both issuers, so A's key vouched for B's API. The set
+    // built from A's own list is the only thing standing between them now, and
+    // the refusal has to say so. A refusal from the union gate would mean this
+    // token never reached the gate under test, and the hole would still be open.
     let h = two_issuers().await;
 
     // Control: A's key works, so what follows is a judgement about the audience
@@ -232,8 +240,8 @@ async fn a_token_signed_by_issuer_a_is_refused_for_issuer_bs_audience() {
 
     assert!(
         reason.contains(PER_ISSUER_REFUSAL),
-        "must be refused by the per-issuer layer, not by the ceiling gate — a \
-         ceiling refusal would mean the layer is the only thing working and this \
+        "must be refused by the issuer gate, not by the union gate — a union \
+         refusal would mean the issuer gate is the only thing working and this \
          test proves nothing about the hole: {reason}"
     );
     assert!(
@@ -255,13 +263,14 @@ async fn a_token_signed_by_issuer_a_is_refused_for_issuer_bs_audience() {
 }
 
 #[tokio::test]
-async fn a_token_outside_every_audience_is_refused_by_the_ceiling_not_the_layer() {
+async fn a_token_outside_every_audience_is_refused_at_the_union_not_the_issuer_gate() {
     // Two refusals for two different reasons, told apart by wording.
-    // `AUD_OUTSIDE` is in no ceiling, so the global gate inside `decode` answers
-    // it and the layer is never reached. `AUD_B` from A is in the ceiling, so
-    // the layer answers it. Both are `InvalidToken`. A deployment debugging a
-    // 401 needs to know which setting it set wrong: the ceiling, or what it
-    // told the issuer it serves.
+    // `AUD_OUTSIDE` is named by no issuer, so it is not in the union and the
+    // gate inside `decode` answers it; the issuer gate is never reached.
+    // `AUD_B` from A *is* in the union, because B named it, so the issuer gate
+    // answers it. Both are `InvalidToken`. A deployment debugging a 401 needs to
+    // know which of the two it got: an audience nothing serves here at all, or
+    // one served by an issuer other than the one that signed the token.
     let h = two_issuers().await;
 
     let outside = refusal(
@@ -272,13 +281,14 @@ async fn a_token_outside_every_audience_is_refused_by_the_ceiling_not_the_layer(
     let reason = outside.to_string();
     assert!(
         !reason.contains(PER_ISSUER_REFUSAL),
-        "an audience outside the ceiling must die at the global gate: {reason}"
+        "an audience no issuer named must die at the union gate: {reason}"
     );
 
     let cross_issuer = refusal(&h.auth, &h.key_a.sign(&h.key_a.claims(&h.iss_a, AUD_B))).await;
     assert!(
         cross_issuer.to_string().contains(PER_ISSUER_REFUSAL),
-        "and an audience inside the ceiling must reach the per-issuer layer: {cross_issuer}"
+        "and an audience some *other* issuer named must reach the issuer gate: \
+         {cross_issuer}"
     );
 }
 
@@ -393,8 +403,8 @@ async fn both_issuers_are_verified_by_their_own_keys_at_the_same_time() {
     assert_eq!(from_a.sub, "user-123", "A's subject survives the verifier");
     assert_eq!(from_b.sub, "user-123", "and so does B's");
 
-    // Each layer holds only its own audience: not one shared set both happen to
-    // satisfy, which is what the ceiling used to be.
+    // Each issuer holds only its own audience: not one shared set both happen to
+    // satisfy, which is what the flat list used to be.
     refusal(&h.auth, &h.key_a.sign(&h.key_a.claims(&h.iss_a, AUD_B))).await;
     refusal(&h.auth, &h.key_b.sign(&h.key_b.claims(&h.iss_b, AUD_A))).await;
 }
@@ -447,16 +457,96 @@ async fn a_configured_azp_admits_one_client_and_refuses_the_rest() {
     );
 }
 
-/// The standard topology with `azp` restricted to these clients.
+#[tokio::test]
+async fn a_client_name_gates_the_issuer_that_named_it_and_no_other() {
+    // A client id is unique inside a realm, not across realms. Two realms you
+    // both trust can each carry a client called `my-client`. While the accepted
+    // clients were one deployment-wide list, B's `my-client` authenticated at
+    // what A's gate was meant to cover — and in a stock realm `aud` is
+    // "account" for every API, so the audience gate reads the same on both
+    // tokens and cannot catch the swap either.
+    //
+    // So A gates on CLIENT and B gates on OTHER_CLIENT. Each name admits only
+    // the issuer that named it.
+    let key_a = TestKey::generate("kid-a");
+    let key_b = TestKey::generate("kid-b");
+    let h = issuers(key_a, key_b, &[AUD_A], &[AUD_B], &[CLIENT], &[OTHER_CLIENT]).await;
+
+    // Controls: each issuer accepts its own client at its own audience.
+    h.auth
+        .authenticate(&h.key_a.sign(&token_claims(&h.iss_a, AUD_A, Some(CLIENT))))
+        .await
+        .expect("issuer A accepts the client it named itself");
+    h.auth
+        .authenticate(
+            &h.key_b
+                .sign(&token_claims(&h.iss_b, AUD_B, Some(OTHER_CLIENT))),
+        )
+        .await
+        .expect("issuer B accepts the client it named itself");
+
+    // The cross. B's key, B's audience, A's client name — everything about this
+    // token is honest except which realm the client lives in. Before `azp` was
+    // scoped to its issuer, the name was on the shared list and this passed.
+    let from_b = refusal(
+        &h.auth,
+        &h.key_b.sign(&token_claims(&h.iss_b, AUD_B, Some(CLIENT))),
+    )
+    .await;
+    assert!(
+        from_b.to_string().contains(CLIENT),
+        "the refusal should name the client it refused: {from_b}"
+    );
+    assert!(
+        from_b.to_string().contains(&h.iss_b),
+        "and the issuer whose client list it was checked against, since the fix \
+         is that issuer's: {from_b}"
+    );
+
+    // And the mirror, so the result is not an accident of argument order.
+    refusal(
+        &h.auth,
+        &h.key_a
+            .sign(&token_claims(&h.iss_a, AUD_A, Some(OTHER_CLIENT))),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn one_issuer_can_gate_on_azp_while_another_does_not() {
+    // The mixed deployment the flat list could not express: a Keycloak realm
+    // that always names a client, beside an issuer that never emits `azp` at
+    // all. A deployment-wide gate rejects every token from the second issuer
+    // for a claim it is incapable of making — an outage shipped as a hardening.
+    // Per issuer, the realm is gated and the other issuer is simply not.
+    let key_a = TestKey::generate("kid-a");
+    let key_b = TestKey::generate("kid-b");
+    let h = issuers(key_a, key_b, &[AUD_A], &[AUD_B], &[CLIENT], &[]).await;
+
+    h.auth
+        .authenticate(&h.key_b.sign(&token_claims(&h.iss_b, AUD_B, None)))
+        .await
+        .expect("the ungated issuer's token with no `azp` is accepted");
+
+    let missing = refusal(&h.auth, &h.key_a.sign(&token_claims(&h.iss_a, AUD_A, None))).await;
+    assert!(
+        missing.to_string().contains("no `azp`"),
+        "the gated issuer still refuses an absent `azp`, gate or no gate \
+         elsewhere: {missing}"
+    );
+}
+
+/// The standard topology with `azp` restricted to these clients **on both
+/// issuers**.
 async fn two_issuers_with_parties(authorized_parties: &[&str]) -> TwoIssuers {
     let key_a = TestKey::generate("kid-a");
     let key_b = TestKey::generate("kid-b");
     issuers(
         key_a,
         key_b,
-        &[AUD_A, AUD_B],
         &[AUD_A],
         &[AUD_B],
+        authorized_parties,
         authorized_parties,
     )
     .await
@@ -472,7 +562,7 @@ async fn a_token_without_azp_is_accepted_while_azp_is_unconfigured() {
     let h = two_issuers().await;
 
     assert!(
-        h.auth.authorized_parties().is_empty(),
+        h.auth.all_authorized_parties().is_empty(),
         "`azp` is unchecked unless it is configured"
     );
 
@@ -500,30 +590,20 @@ async fn a_token_without_azp_is_accepted_while_azp_is_unconfigured() {
 
 // ── Topologies that must not boot ────────────────────────────────────────────
 
-#[tokio::test]
-async fn an_issuer_that_names_no_audiences_refuses_to_boot_beside_a_second_issuer() {
-    // With one issuer the ceiling *is* its audience set, so naming nothing is
-    // harmless. With two, an unspecified issuer silently accepts the whole
-    // ceiling. That is the cross-issuer confusion this suite exists to close,
-    // reached by forgetting a flag rather than by choosing it. The message also
-    // has to name *which* issuer is under-specified. Six realms and one line
-    // that does not say which is a bisect, not a diagnosis.
-    let config = AuthConfig::empty()
-        .with_audience(AUD_A)
-        .with_audience(AUD_B)
-        .with_issuer(
-            Issuer::discover("https://identity.example/realms/a")
-                .expect("valid issuer")
-                .audience(AUD_A),
-        )
-        .with_issuer(Issuer::discover("https://identity.example/realms/b").expect("valid issuer"));
+// The refusal happens where the mistake is, not at boot. Arity forces the
+// set to be addressed, but `[]` is a value that addresses it with nothing,
+// and only the constructor can see inside the iterator. So this needs no
+// server, no config, and no two-issuer topology: one call fails.
+#[test]
+fn an_issuer_that_names_no_audiences_is_refused_and_says_which() {
+    // An empty audience list used to be legal for the only issuer, because a
+    // deployment-wide list stood in for it. Nothing stands in now, so an empty
+    // list reads as "anything", for every issuer, and is refused. The message
+    // still has to name *which* issuer is under-specified: six realms and one
+    // line that does not say which is a bisect, not a diagnosis.
+    let err = Issuer::discover("https://identity.example/realms/b", Vec::<String>::new())
+        .expect_err("an issuer that names no audience is not an issuer");
 
-    // No network anywhere in this test: `validate` is the first statement of
-    // `start`, so a bad audience topology cannot reach discovery or open a
-    // socket. The realms are notional for exactly that reason.
-    let err = Authenticator::start(config)
-        .await
-        .expect_err("an unspecified issuer in a two-issuer topology is not bootable");
     assert!(matches!(err, AuthError::Configuration(_)), "{err:?}");
 
     let reason = err.to_string();
@@ -531,46 +611,37 @@ async fn an_issuer_that_names_no_audiences_refuses_to_boot_beside_a_second_issue
         reason.contains("realms/b"),
         "the message must name the under-specified issuer: {reason}"
     );
-    assert!(
-        !reason.contains("realms/a"),
-        "and must not blame the issuer that stated its audiences: {reason}"
-    );
 }
 
 #[tokio::test]
-async fn a_per_issuer_audience_outside_the_ceiling_refuses_to_boot_and_says_which() {
-    // A per-issuer audience the ceiling does not contain can never match a
-    // token, because the verifier enforces the intersection. Left unrefused it
-    // ships a caller who cannot authenticate for any reason they can be told,
-    // and an outage nobody can diagnose. So this is a boot failure, naming both
-    // the audience and the issuer that named it.
+async fn an_issuer_naming_a_blank_authorised_party_refuses_to_boot_and_says_which() {
+    // A blank `azp` could never match a token, so it is an outage dressed as a
+    // security control. It is refused at boot, naming the audience the gate
+    // sits beside and the issuer that named the blank — the issuer is the one
+    // to fix, since the gate belongs to it and not to the deployment.
     let config = AuthConfig::empty()
-        .with_audience(AUD_A)
-        .with_audience(AUD_B)
         .with_issuer(
-            Issuer::discover("https://identity.example/realms/a")
-                .expect("valid issuer")
-                .audience(AUD_A),
+            Issuer::discover("https://identity.example/realms/a", [AUD_A]).expect("valid issuer"),
         )
         .with_issuer(
-            Issuer::discover("https://identity.example/realms/b")
+            Issuer::discover("https://identity.example/realms/b", [AUD_B])
                 .expect("valid issuer")
-                .audience("tenant-c-api"),
+                .authorized_party(""),
         );
 
     let err = Authenticator::start(config)
         .await
-        .expect_err("an audience outside the ceiling is not bootable");
+        .expect_err("a gate that can never open is not bootable");
     assert!(matches!(err, AuthError::Configuration(_)), "{err:?}");
 
     let reason = err.to_string();
     assert!(
-        reason.contains("tenant-c-api"),
-        "the message must name the stray audience: {reason}"
+        reason.contains("azp"),
+        "the message must name the claim at fault: {reason}"
     );
     assert!(
         reason.contains("realms/b"),
-        "and the issuer that named it, since that is the one to fix: {reason}"
+        "and the issuer that named the blank entry: {reason}"
     );
     assert!(
         !reason.contains("realms/a"),
@@ -578,22 +649,20 @@ async fn a_per_issuer_audience_outside_the_ceiling_refuses_to_boot_and_says_whic
     );
 }
 
-// ── What did not move: the single-issuer deployment. ──────────────────
+// ── What still works unchanged: a deployment with one issuer. ──────────────
 
 #[tokio::test]
-async fn a_lone_issuer_that_names_no_audiences_still_boots_and_authenticates() {
-    // The mandatory-per-issuer rule is scoped to the *second* issuer. That is
-    // precisely so this deployment upgrades without a new flag, and this test is
-    // the proof rather than the assumption. If it breaks, the change is
-    // breaking for every existing user however correct the multi-issuer half
-    // is.
+async fn a_lone_issuer_naming_its_own_audience_boots_and_authenticates() {
+    // A single-issuer deployment needs no second list and no inheritance rule:
+    // it names its audience where it always named its issuer. What changed is
+    // that the name is now required rather than optional — see
+    // `refusing_to_name_an_audience_is_a_configuration_error` in `config.rs`.
     let key = TestKey::generate("kid-lone");
     let stub = StubIssuer::start_local(std::slice::from_ref(&key)).await;
     let iss = stub.iss();
 
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover(iss.clone()).expect("valid issuer"))
-        .with_audience(AUD_A)
+        .with_issuer(Issuer::discover(iss.clone(), [AUD_A]).expect("valid issuer"))
         .with_policy(CachePolicy {
             min_fetch_gap: Duration::from_secs(1),
             timeout: Duration::from_secs(2),
@@ -603,7 +672,7 @@ async fn a_lone_issuer_that_names_no_audiences_still_boots_and_authenticates() {
 
     let auth = Authenticator::start(config)
         .await
-        .expect("a lone issuer with no per-issuer audience list must still boot");
+        .expect("a lone issuer that names its own audience must boot");
 
     let claims = auth
         .authenticate(&key.sign(&key.claims(&iss, AUD_A)))
@@ -612,40 +681,60 @@ async fn a_lone_issuer_that_names_no_audiences_still_boots_and_authenticates() {
     assert_eq!(claims.sub, "user-123");
     assert_eq!(claims.iss, iss);
 
-    // Inheriting the ceiling is not the same as ignoring it: an audience the
-    // lone issuer never served was never in scope, and still is not.
+    // Naming one audience means naming only that one. An audience this issuer
+    // never claimed was never in scope.
     let err = auth
         .authenticate(&key.sign(&key.claims(&iss, AUD_OUTSIDE)))
         .await
-        .expect_err("an audience outside the ceiling is still refused");
+        .expect_err("an audience no issuer named is still refused");
     assert!(matches!(err, AuthError::InvalidToken(_)), "{err:?}");
 }
 
 #[test]
-fn a_lone_issuer_inherits_the_ceiling_it_did_not_restate() {
-    // The read side of the same rule, without a server. The accessor answers
-    // with the ceiling for an issuer that named nothing, and with its own
-    // narrowed list for one that did. Both are subsets of the ceiling by
-    // construction. That is the property the request path depends on. Nothing
-    // can ask this accessor for an audience the ceiling would have refused.
+fn each_issuer_sees_its_own_scope_and_the_deployment_sees_the_union() {
+    // The read side, without a server. An issuer answers with the list it was
+    // built with, and `AuthConfig` answers with the union of those lists —
+    // derived, so it cannot name an audience no issuer asked for, and cannot
+    // omit one some issuer did. There is no longer an accessor that hands back
+    // "the whole deployment for an issuer that said nothing", because nothing can
+    // say nothing.
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::discover("https://identity.example").expect("valid issuer"))
         .with_issuer(
-            Issuer::discover("https://other.example")
+            Issuer::discover("https://identity.example", [AUD_A])
                 .expect("valid issuer")
-                .audience(AUD_B),
+                .authorized_party(CLIENT),
         )
-        .with_audience(AUD_A)
-        .with_audience(AUD_B);
+        .with_issuer(
+            Issuer::discover("https://other.example", [AUD_B, AUD_A]).expect("valid issuer"),
+        );
 
     assert_eq!(
-        config.issuer_audiences(&config.issuers[0]),
-        [AUD_A.to_owned(), AUD_B.to_owned()],
-        "the issuer that named nothing inherits the whole ceiling"
+        config.issuers[0].audiences(),
+        [AUD_A],
+        "the first issuer serves only what it named"
     );
     assert_eq!(
-        config.issuer_audiences(&config.issuers[1]),
-        [AUD_B.to_owned()],
-        "the issuer that named its own gets only that, and not `AUD_A`"
+        config.issuers[1].audiences(),
+        [AUD_B, AUD_A],
+        "the second serves what it named, in the order it named them"
+    );
+    assert_eq!(
+        config.all_audiences(),
+        [AUD_A.to_owned(), AUD_B.to_owned()],
+        "the union is derived from the issuers and deduplicated"
+    );
+    assert_eq!(
+        config.issuers[0].authorized_parties(),
+        [CLIENT],
+        "`azp` is stated per issuer too"
+    );
+    assert!(
+        config.issuers[1].authorized_parties().is_empty(),
+        "and an issuer that named none gates on none"
+    );
+    assert_eq!(
+        config.all_authorized_parties(),
+        [CLIENT.to_owned()],
+        "the derived `azp` union names the one client any issuer asked for"
     );
 }

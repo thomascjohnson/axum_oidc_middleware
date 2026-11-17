@@ -60,25 +60,44 @@ struct Inner {
     /// tests this set against the token header before it reads a key. So this,
     /// not the per-family selection, is what keeps `none` and HMAC unreachable.
     allowed: Vec<Algorithm>,
-    /// The audience ceiling, copied once so the accessor is allocation-free.
-    /// This is the widest set any token may name. Every entry of every
-    /// [`Self::issuer_audiences`] layer came out of it.
-    audiences: Vec<String>,
-    /// Per-issuer audience layers, keyed by the exact `iss`. Each one is
-    /// `audiences ∩ issuer.audiences`, computed once here, never per request.
+    /// Every `aud` any configured issuer asked for, derived once here so the
+    /// accessor is allocation-free. **Reporting only — no gate reads it.**
     ///
-    /// Two gates produce this intersection, and neither is a convention. The
-    /// `Validation` behind [`FamilyValidations::for_key`] already requires
-    /// `aud` to be in the ceiling, and
-    /// [`Authenticator::check_issuer_audience`] then requires it to be in this
-    /// issuer's layer. A token has to clear both, so the crate accepts exactly
-    /// the intersection by construction. Every layer here comes from filtering
-    /// the ceiling, so no layer can name an audience the ceiling does not.
+    /// The union `jsonwebtoken` enforces is a different value with a different
+    /// lifetime: [`base_validation`] builds it from the config, and that is what
+    /// `set_audience` receives. This copy exists so
+    /// [`Authenticator::all_audiences`] can answer without re-walking the issuers at
+    /// call time. The `_for_reporting` suffix is the point. An earlier shape of
+    /// this struct kept one `Vec` of accepted audiences and the verifier read
+    /// it, so any trusted issuer could vouch for any audience the deployment
+    /// served. The field must not be able to grow back into that by being
+    /// reached for out of habit.
+    audiences_for_reporting: Vec<String>,
+    /// Per-issuer audience sets, keyed by the exact `iss`, copied once here
+    /// rather than walked per request.
+    ///
+    /// Two gates run on `aud`, and both must pass. The `Validation` behind
+    /// [`FamilyValidations::for_key`] requires the union; this gate requires
+    /// the *issuer's own* set. So a token minted for one issuer's audience is
+    /// refused by an authenticator that also trusts another issuer for it, which
+    /// is the confusion a single shared list re-creates.
+    ///
+    /// Every entry comes straight from an `Issuer` that had to name at least
+    /// one audience to exist. There is no ceiling to intersect with and no
+    /// inherit branch: the answer for an issuer is the list on that issuer.
     issuer_audiences: HashMap<String, Vec<String>>,
-    /// Accepted `azp` values. Empty means the gate is off. The crate applies
-    /// this gate after the signature and `aud`/`iss` gates, never in place of
-    /// them.
-    authorized_parties: Vec<String>,
+    /// Every `azp` named by any issuer, derived once, for the accessor.
+    /// Reporting only — nothing here accepts a token, and the name says so.
+    authorized_parties_for_reporting: Vec<String>,
+    /// Per-issuer `azp` sets, keyed by the exact `iss`. An entry is the set of
+    /// clients accepted *from that issuer*, and the `azp` gate is off for an
+    /// issuer whose entry is empty.
+    ///
+    /// The key is the verified `iss` rather than a union because a client id is
+    /// unique within a realm, not across realms. The reasoning, and the swap a
+    /// shared list would allow, are on
+    /// [`Issuer::authorized_parties()`](crate::Issuer::authorized_parties).
+    issuer_authorized_parties: HashMap<String, Vec<String>>,
 }
 
 impl Authenticator {
@@ -135,27 +154,20 @@ impl Authenticator {
             .map(|algorithm| algorithm.decoding())
             .collect();
 
-        // Each issuer's accepted audience set, resolved once. The code spells
-        // out the filter even though `config.validate()` already refused any
-        // entry outside the ceiling. The reason is the same one why `jwks`
-        // re-tests `family() != Hmac` after an allowlisted `kty` match.
-        // `from_registry` is crate-internal and does not go through `validate`.
-        // So the property wanted here should follow from the code that builds
-        // the value, not from the discipline of every caller. That property is:
-        // no issuer can be served an audience the ceiling would have refused.
-        let issuer_audiences = config
+        // Each issuer's accepted audience set and accepted `azp` set, resolved
+        // once. Both are copied straight off the `Issuer`, not derived from a
+        // deployment-wide list: the `Issuer` is the only place either scope is
+        // stated, and `validate` already refused an issuer that named no
+        // audience.
+        let issuer_audiences: HashMap<String, Vec<String>> = config
             .issuers
             .iter()
-            .map(|issuer| {
-                let declared = config.issuer_audiences(issuer);
-                let layer: Vec<String> = config
-                    .audiences()
-                    .iter()
-                    .filter(|aud| declared.contains(aud))
-                    .cloned()
-                    .collect();
-                (issuer.iss.clone(), layer)
-            })
+            .map(|issuer| (issuer.iss.clone(), issuer.audiences().to_vec()))
+            .collect();
+        let issuer_authorized_parties: HashMap<String, Vec<String>> = config
+            .issuers
+            .iter()
+            .map(|issuer| (issuer.iss.clone(), issuer.authorized_parties().to_vec()))
             .collect();
 
         Self {
@@ -163,9 +175,10 @@ impl Authenticator {
                 keys,
                 allowed,
                 validations,
-                audiences: config.audiences().to_vec(),
+                audiences_for_reporting: config.all_audiences(),
                 issuer_audiences,
-                authorized_parties: config.authorized_parties.clone(),
+                authorized_parties_for_reporting: config.all_authorized_parties(),
+                issuer_authorized_parties,
             }),
         }
     }
@@ -175,19 +188,48 @@ impl Authenticator {
         self.inner.keys.issuers()
     }
 
-    /// The audience ceiling: every `aud` any issuer may be accepted for.
+    /// Every `aud` any configured issuer asked for, across all of them.
     ///
     /// This is not what a given token may name. Two issuers serving different
     /// audiences report the union here and the narrow set only through
-    /// [`AuthConfig::issuer_audiences`], because the narrow set is what the
-    /// verifier enforces.
-    pub fn audiences(&self) -> &[String] {
-        &self.inner.audiences
+    /// [`Self::issuer_audiences`], because the narrow set is what the verifier
+    /// enforces. It is derived from the issuers, not set beside them — see
+    /// [`AuthConfig::all_audiences`].
+    ///
+    /// Reporting only, like the field behind it: this is the union of what
+    /// [`Self::issuer_audiences`] answers for each issuer, never a set a token is
+    /// checked against on its own. `the_reporting_unions_match_the_per_issuer_sets`
+    /// pins the two to the same value. The `all_` prefix marks the width, so a
+    /// caller cannot mistake it for the narrower answer beside it.
+    pub fn all_audiences(&self) -> &[String] {
+        &self.inner.audiences_for_reporting
     }
 
-    /// The `azp` values a token may name, empty when that gate is off.
-    pub fn authorized_parties(&self) -> &[String] {
-        &self.inner.authorized_parties
+    /// The `aud` values a token from `iss` may name, or `None` when no such
+    /// issuer is configured. This is the set the audience gate enforces.
+    pub fn issuer_audiences(&self, iss: &str) -> Option<&[String]> {
+        self.inner.issuer_audiences.get(iss).map(Vec::as_slice)
+    }
+
+    /// Every `azp` named by any configured issuer, empty when none gates on
+    /// `azp`.
+    ///
+    /// Reporting only, like the field behind it. An entry here is accepted only
+    /// from the issuer that named it, which is what
+    /// [`Self::issuer_authorized_parties`] holds. This is the union of those
+    /// per-issuer sets, not a set any gate consults.
+    pub fn all_authorized_parties(&self) -> &[String] {
+        &self.inner.authorized_parties_for_reporting
+    }
+
+    /// The `azp` values a token from `iss` may name, or `None` when no such
+    /// issuer is configured. An empty slice means that issuer's `azp` gate is
+    /// off, and it is off for that issuer alone.
+    pub fn issuer_authorized_parties(&self, iss: &str) -> Option<&[String]> {
+        self.inner
+            .issuer_authorized_parties
+            .get(iss)
+            .map(Vec::as_slice)
     }
 
     /// The per-issuer audience gate. It runs once the verified `iss` is known.
@@ -196,15 +238,15 @@ impl Authenticator {
     /// `Validation`. A token's issuer is only *known* after its signature
     /// passes. Picking a per-issuer `Validation` from the unverified `iss` would
     /// choose a trust decision from a claim that verification has not yet
-    /// proven. So `decode` enforces the ceiling and this gate enforces the
-    /// layer, one gate on top of the other. Both must pass, which *is* the
-    /// intersection. This one can only ever refuse: a token that named nothing
-    /// acceptable would have failed the ceiling gate already.
+    /// proven. So `decode` enforces the union of every issuer's audiences and
+    /// this gate enforces the one issuer's set, one gate on top of the other.
+    /// Both must pass. This one can only ever refuse: a token that named
+    /// nothing acceptable would have failed the union gate already.
     ///
-    /// A missing layer is a refusal rather than a pass-through. It is
+    /// A missing entry is a refusal rather than a pass-through. It is
     /// unreachable for an authenticator built by `start`: every configured
-    /// issuer gets a layer, and one statement earlier the signature bound `iss`
-    /// to a configured issuer. But an empty layer reads fail-closed as "this
+    /// issuer gets an entry, and one statement earlier the signature bound `iss`
+    /// to a configured issuer. But an empty entry reads fail-closed as "this
     /// issuer has no configured audience". A default that accepted would bring
     /// the vulnerability back through a `HashMap::get`.
     fn check_issuer_audience(&self, claims: &Claims) -> Result<(), AuthError> {
@@ -222,34 +264,60 @@ impl Authenticator {
         }
     }
 
-    /// The authorised-party gate. It runs after everything else passed.
+    /// The authorised-party gate. It runs after everything else passed, and it
+    /// is scoped to the issuer that signed the token.
     ///
     /// This is deliberately a second gate rather than an alternative audience
-    /// rule. A token must already have named a trusted `aud` to reach here, so
-    /// this can only ever narrow the callers the crate accepts, never widen
-    /// them. Substituting `azp` for `aud` would accept whichever of the two a
-    /// token happened to carry.
+    /// rule. A token already named a trusted `aud` for its own issuer to get
+    /// here, so this can only ever narrow the callers the crate accepts, never
+    /// widen them. Substituting `azp` for `aud` would accept whichever of the
+    /// two a token happened to carry.
     ///
-    /// When you configure this gate, a missing `azp` is a rejection. Otherwise
-    /// an absent claim would defeat the gate.
-    fn check_authorised_party(&self, claims: &Claims) -> Result<Claims, AuthError> {
-        if self.inner.authorized_parties.is_empty() {
-            return Ok(claims.clone());
+    /// The accepted set is looked up under the verified `iss`, which is the whole
+    /// point of the lookup. A client id is unique within a realm, not across
+    /// realms, so one shared list would let realm B's `my-app` authenticate where
+    /// realm A's is meant to — see
+    /// [`Issuer::authorized_parties()`](crate::Issuer::authorized_parties) for why
+    /// `aud` cannot catch that swap either.
+    ///
+    /// An empty set means that issuer gates on nothing — which is what an issuer
+    /// that never emits `azp` needs, and it is off for that issuer alone. When
+    /// the set is not empty, a missing `azp` is a rejection. Otherwise an absent
+    /// claim would defeat the gate.
+    ///
+    /// A missing entry refuses, like [`Self::check_issuer_audience`]. Both maps
+    /// are keyed off the same `config.issuers`, so neither can be missing one
+    /// the other has. The message names the missing fact rather than reporting an
+    /// empty client list, because the two have different fixes: a blank list is a
+    /// policy choice, and an issuer with no entry is a config that drifted from
+    /// its keys.
+    fn check_authorised_party(&self, claims: &Claims) -> Result<(), AuthError> {
+        let accepted = self
+            .inner
+            .issuer_authorized_parties
+            .get(&claims.iss)
+            .ok_or_else(|| {
+                AuthError::InvalidToken(format!("issuer `{}` is not configured", claims.iss))
+            })?;
+        if accepted.is_empty() {
+            return Ok(());
         }
 
         match claims.azp.as_deref() {
-            Some(azp) if self.inner.authorized_parties.iter().any(|p| p == azp) => {
-                Ok(claims.clone())
-            }
+            Some(azp) if accepted.iter().any(|party| party == azp) => Ok(()),
             // Distinguished in the message only. Both are the same refusal,
             // and `azp`-absent versus `azp`-unexpected is enough to tell a
-            // misconfigured client scope apart from the wrong client.
+            // misconfigured client scope apart from the wrong client. The
+            // issuer is named because the accepted set is its own.
             Some(other) => Err(AuthError::InvalidToken(format!(
-                "`azp` `{other}` is not an authorised party for this API"
+                "`azp` `{other}` is not an authorised party for issuer `{}` here",
+                claims.iss
             ))),
-            None => Err(AuthError::InvalidToken(
-                "token has no `azp` claim, which this API requires".to_owned(),
-            )),
+            None => Err(AuthError::InvalidToken(format!(
+                "token from issuer `{}` has no `azp` claim, which this API requires \
+                 from that issuer",
+                claims.iss
+            ))),
         }
     }
 
@@ -370,10 +438,10 @@ impl Authenticator {
 
         // ── 5. Which audiences may *this* issuer vouch for? ─────────────────
         //
-        // After the `iss` binding above, deliberately. The layer keys on the
+        // After the `iss` binding above, deliberately. The gate keys on the
         // issuer whose key verified the signature, not on the one the header
-        // claimed. `decode` already required `aud` to sit inside the ceiling.
-        // This gate requires it to sit inside the audience set for this issuer.
+        // claimed. `decode` already required `aud` to sit inside the union of
+        // every issuer's set. This gate requires it to sit inside this issuer's.
         self.check_issuer_audience(&claims)?;
 
         // ── 6. Which client is this token for? ─────────────────────────
@@ -382,7 +450,8 @@ impl Authenticator {
         // passed to reach here. Keycloak's `aud` is often useless, because a
         // stock realm puts `"account"` in it for every API. That is what this
         // gate is for. It never stands in for `aud`.
-        self.check_authorised_party(&claims)
+        self.check_authorised_party(&claims)?;
+        Ok(claims)
     }
 
     /// One `jsonwebtoken` decode: signature over `key`, then `exp`/`nbf`,
@@ -531,15 +600,16 @@ impl FamilyValidations {
 /// algorithm list, which is per family and always replaced by
 /// [`FamilyValidations::new`].
 ///
-/// Its audience set is the **ceiling**, not any issuer's narrower list, and
-/// that is not an oversight. A per-issuer audience set cannot live in a
-/// `Validation` shared across a family without becoming a second selection
-/// axis. The (family × issuer) cross product would need its own way to be
-/// chosen, which is precisely the second algorithm gate this crate refuses to
-/// have. Narrowing by issuer happens after the signature instead, in
-/// [`Authenticator::check_issuer_audience`], where the issuer is a verified
-/// fact rather than an unverified claim. The two gates in series accept
-/// `ceiling ∩ issuer`, which is the whole point.
+/// Its audience set is the **union** of every configured issuer's set, and that
+/// is not an oversight. A per-issuer audience set cannot live in a `Validation`
+/// shared across a family without becoming a second selection axis. The
+/// (family × issuer) cross product would need its own way to be chosen, which is
+/// precisely the second algorithm gate this crate refuses to have. Narrowing by
+/// issuer happens after the signature instead, in
+/// [`Authenticator::check_issuer_audience`], where the issuer is a verified fact
+/// rather than an unverified claim. The two gates in series accept only what the
+/// signing issuer itself named, which is the whole point: the union can only be
+/// as wide as what the issuers asked for, since it is derived from them.
 fn base_validation(config: &AuthConfig) -> Validation {
     let mut validation = Validation::new(
         config
@@ -587,7 +657,11 @@ fn base_validation(config: &AuthConfig) -> Validation {
             .map(|issuer| issuer.iss.as_str())
             .collect::<Vec<_>>(),
     );
-    validation.set_audience(config.audiences());
+    // The union of what the issuers asked for, so this gate is the wide one and
+    // `check_issuer_audience` is the narrow one. Bound rather than inlined:
+    // `set_audience` takes `&[T]`, and a temporary would not outlive the call.
+    let accepted_audiences = config.all_audiences();
+    validation.set_audience(&accepted_audiences);
 
     validation
 }
@@ -872,9 +946,9 @@ mod tests {
     /// every issuer, silently.
     #[test]
     fn leeway_is_clamped_even_when_validate_was_never_called() {
-        let runaway = AuthConfig::empty()
-            .with_audience("qg")
-            .with_issuer(Issuer::discover("https://idp.example.com").expect("valid issuer"));
+        let runaway = AuthConfig::empty().with_issuer(
+            Issuer::discover("https://idp.example.com", ["qg"]).expect("valid issuer"),
+        );
         assert_eq!(
             runaway.leeway, 30,
             "the default must be untouched by the clamp"
@@ -898,9 +972,9 @@ mod tests {
         // And the public path still refuses outright rather than silently
         // correcting what the operator wrote.
         let rejected = {
-            let mut config = AuthConfig::empty()
-                .with_audience("qg")
-                .with_issuer(Issuer::discover("https://idp.example.com").expect("valid issuer"));
+            let mut config = AuthConfig::empty().with_issuer(
+                Issuer::discover("https://idp.example.com", ["qg"]).expect("valid issuer"),
+            );
             config.leeway = crate::config::MAX_LEEWAY_SECS + 1;
             config.validate()
         };
@@ -920,6 +994,123 @@ mod tests {
             base64_url_decode("abc").expect("legal unpadded base64url"),
             vec![0x69, 0xb7]
         );
+    }
+
+    /// The two copies of one fact do not drift.
+    ///
+    /// [`Inner`] names each scope twice: per issuer, for the gates, and as one
+    /// union, for the accessors. Nothing in the gates reads the union, so the
+    /// accessors are the only consumer — and they are what a host wires into a
+    /// startup log line or a `/health` payload. A union that disagreed with the
+    /// per-issuer sets would therefore be believed *because* nothing enforces
+    /// it. So it is asserted to be exactly the deduplicated union of the sets
+    /// the gates read, in issuer order.
+    #[test]
+    fn the_reporting_unions_match_the_per_issuer_sets() {
+        let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
+        let other_url = Url::parse("https://other.example/jwks.json").expect("a JWKS URL");
+        let registry = JwksRegistry::new(
+            [
+                ("https://issuer.example".to_owned(), jwks_url.clone()),
+                ("https://other.example".to_owned(), other_url.clone()),
+            ],
+            &["RS256".to_owned()],
+            CachePolicy::default(),
+            false,
+        )
+        .expect("two issuers, one algorithm");
+
+        // `billing` appears on both issuers on purpose: the union deduplicates.
+        let config = AuthConfig::empty().with_issuers([
+            Issuer::with_jwks_url("https://issuer.example", jwks_url, ["api", "billing"])
+                .expect("an issuer")
+                .authorized_party("client"),
+            Issuer::with_jwks_url("https://other.example", other_url, ["billing", "reports"])
+                .expect("an issuer"),
+        ]);
+
+        let auth = Authenticator::from_registry(registry, &config);
+
+        assert_eq!(
+            auth.all_audiences().to_vec(),
+            vec!["api", "billing", "reports"],
+            "issuer order, first occurrence kept"
+        );
+        assert_eq!(
+            auth.all_authorized_parties().to_vec(),
+            vec!["client"],
+            "the second issuer gates on nothing, so it adds nothing here"
+        );
+
+        // The same answer, recomputed from the maps the gates actually read.
+        // This is the assertion that would fail if a future edit updated one
+        // copy and not the other.
+        let mut derived: Vec<String> = Vec::new();
+        for iss in ["https://issuer.example", "https://other.example"] {
+            for aud in auth
+                .issuer_audiences(iss)
+                .expect("every configured issuer has an entry")
+            {
+                if !derived.contains(aud) {
+                    derived.push(aud.clone());
+                }
+            }
+        }
+        assert_eq!(
+            auth.all_audiences(),
+            derived.as_slice(),
+            "the reporting union must equal the union of the per-issuer sets"
+        );
+    }
+
+    /// The `azp` gate refuses an issuer it has no entry for, and says that.
+    ///
+    /// The same disagreement shape as the audience counterpart below: keys and
+    /// config that drifted apart. Two things are pinned. The arm refuses rather
+    /// than falling through to "no client list, so no gate", which is the
+    /// fail-open reading. And it reports the missing *issuer*, not a blank client
+    /// list, because a blank list is legal policy while a missing entry is a
+    /// broken config — different fixes, so different sentences.
+    #[test]
+    fn an_issuer_with_no_authorised_party_entry_refuses_rather_than_accepting() {
+        let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
+        let registry = JwksRegistry::new(
+            [("https://issuer.example".to_owned(), jwks_url.clone())],
+            &["RS256".to_owned()],
+            CachePolicy::default(),
+            false,
+        )
+        .expect("one issuer, one algorithm");
+
+        let config = AuthConfig::empty().with_issuer(
+            Issuer::with_jwks_url("https://issuer.example", jwks_url, ["api"]).expect("an issuer"),
+        );
+
+        let auth = Authenticator::from_registry(registry, &config);
+
+        let claims_for = |iss: &str| {
+            serde_json::from_value::<Claims>(serde_json::json!({
+                "sub": "user-1",
+                "iss": iss,
+                "aud": ["api"],
+                "exp": 4_000_000_000_i64,
+            }))
+            .expect("claims")
+        };
+
+        let err = auth
+            .check_authorised_party(&claims_for("https://some-other-issuer.example"))
+            .expect_err("no entry means no policy, which is a refusal");
+        assert!(
+            err.to_string().contains("is not configured"),
+            "the refusal must name the missing issuer rather than report an empty \
+             client list, which is a legal configuration: {err}"
+        );
+
+        // And the configured issuer with no `azp` gate is the settled empty
+        // case, not the missing one: the gate is off, so this passes.
+        auth.check_authorised_party(&claims_for("https://issuer.example"))
+            .expect("an issuer that named no clients gates on none");
     }
 
     /// The crate refuses an issuer with no audience layer rather than waving it
@@ -950,13 +1141,9 @@ mod tests {
         )
         .expect("one issuer, one algorithm");
 
-        let config = AuthConfig::empty()
-            .with_issuer(
-                Issuer::with_jwks_url("https://issuer.example", jwks_url)
-                    .expect("an issuer")
-                    .audience("api"),
-            )
-            .with_audience("api");
+        let config = AuthConfig::empty().with_issuer(
+            Issuer::with_jwks_url("https://issuer.example", jwks_url, ["api"]).expect("an issuer"),
+        );
 
         let auth = Authenticator::from_registry(registry, &config);
 
@@ -1084,13 +1271,9 @@ mod tests {
             false,
         )
         .expect("one issuer, one algorithm");
-        let config = AuthConfig::empty()
-            .with_issuer(
-                Issuer::with_jwks_url("https://issuer.example", jwks_url)
-                    .expect("an issuer")
-                    .audience("api"),
-            )
-            .with_audience("api");
+        let config = AuthConfig::empty().with_issuer(
+            Issuer::with_jwks_url("https://issuer.example", jwks_url, ["api"]).expect("an issuer"),
+        );
         let auth = Authenticator::from_registry(registry, &config);
 
         let token = jsonwebtoken::encode(

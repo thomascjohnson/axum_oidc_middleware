@@ -524,10 +524,12 @@ fn refusal(outcome: Result<(), AuthError>) -> String {
 /// unwrapping. Which one happened is the assertion.
 async fn start(issuer: &HostileIssuer, key: &TestKey, max_bytes: usize) -> Result<(), AuthError> {
     let config = AuthConfig::empty()
-        .with_issuer(Issuer::with_jwks_url(issuer.iss(), issuer.jwks_url()).expect("valid issuer"))
+        .with_issuer(
+            Issuer::with_jwks_url(issuer.iss(), issuer.jwks_url(), [AUDIENCE])
+                .expect("valid issuer"),
+        )
         .with_policy(policy(max_bytes))
-        .with_insecure_http(true)
-        .with_audience(AUDIENCE);
+        .with_insecure_http(true);
 
     // `algorithms` defaults to RS256, which is what `TestKey::generate` is.
     let _ = key;
@@ -713,10 +715,11 @@ async fn a_jwks_exactly_at_the_cap_is_accepted() {
     // Accepted *and* usable: the bytes survived reassembly across chunks.
     let auth = Authenticator::start(
         AuthConfig::empty()
-            .with_issuer(Issuer::with_jwks_url(issuer.iss(), issuer.jwks_url()).expect("issuer"))
+            .with_issuer(
+                Issuer::with_jwks_url(issuer.iss(), issuer.jwks_url(), [AUDIENCE]).expect("issuer"),
+            )
             .with_policy(policy(size))
-            .with_insecure_http(true)
-            .with_audience(AUDIENCE),
+            .with_insecure_http(true),
     )
     .await
     .expect("a second fetch of the same document");
@@ -835,10 +838,10 @@ async fn a_jwks_whose_stream_ends_mid_document_is_reported_as_an_outage() {
     let outcome = Authenticator::start(
         AuthConfig::empty()
             .with_issuer(
-                Issuer::with_jwks_url(issuer.iss(), issuer.jwks_url()).expect("valid issuer"),
+                Issuer::with_jwks_url(issuer.iss(), issuer.jwks_url(), [AUDIENCE])
+                    .expect("valid issuer"),
             )
-            .with_insecure_http(true)
-            .with_audience(AUDIENCE),
+            .with_insecure_http(true),
     )
     .await;
 

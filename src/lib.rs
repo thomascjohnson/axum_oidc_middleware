@@ -29,19 +29,21 @@
 //! use axum::{middleware, routing::post, Router};
 //!
 //! # async fn example() -> Result<Router, axum_oidc_middleware::AuthError> {
-//! // Call the builder methods. The fields are private, so `audiences` cannot
-//! // become empty by omission.
-//! let config = AuthConfig::empty()
-//!     .with_issuers([
-//!         Issuer::discover("https://accounts.google.com")?,
-//!         Issuer::discover("https://sso.example.com/realms/sagaci")?,
-//!     ])
-//!     // Required. You cannot turn audience validation off.
-//!     .with_audience("myaudience")
-//!     // Optional. In a stock Keycloak realm, `aud` is "account" for every API,
-//!     // so name the client here too. This crate enforces `azp` in addition to
-//!     // the audience, never instead of it.
-//!     .with_authorized_parties(["myclient"]);
+//! // Each issuer names the audiences its own tokens may carry. There is no
+//! // deployment-wide audience list to inherit, and no way to build an issuer
+//! // that has not answered the question.
+//! let config = AuthConfig::empty().with_issuers([
+//!     // Google never makes an `azp` claim, so this issuer names no client. Its
+//!     // `azp` gate is off — and off for this issuer alone.
+//!     Issuer::discover("https://accounts.google.com", ["myaudience"])?,
+//!     // In a stock Keycloak realm, `aud` is "account" for every API, so name
+//!     // the client here too. This crate enforces `azp` in addition to the
+//!     // audience, never instead of it. Named on the issuer because a client id
+//!     // is unique within a realm, not across realms: the `myclient` in this
+//!     // realm is not the `myclient` in any other.
+//!     Issuer::discover("https://sso.example.com/realms/sagaci", ["myaudience"])?
+//!         .authorized_party("myclient"),
+//! ]);
 //!
 //! // This call fails now if an issuer is unreachable or its keys will not load.
 //! let auth = Authenticator::start(config).await?;
@@ -183,13 +185,14 @@
 //!    `decode` was already permitted by step 1. This crate compares `iss` with
 //!    the issuer that actually verified the signature, so step 2 can never be
 //!    a way to launder a wrong issuer.
-//! 5. **`azp` narrows further, if you configure it.**
-//!    [`AuthConfig::authorized_parties`] names the clients that may call you.
-//!    Keycloak puts `"account"` in `aud` for every API in a stock realm, so
-//!    `aud` alone often distinguishes nothing there while `azp` reliably names
-//!    the client. This crate enforces `azp` *after* `aud` and never instead of
-//!    it, so it can only shrink the accepted set. There is no configuration
-//!    where satisfying either claim is enough.
+//! 5. **`azp` narrows further, per issuer, if that issuer configures it.**
+//!    [`Issuer::authorized_parties()`] names the clients accepted *from that
+//!    issuer*, looked up under the verified `iss`. In a stock Keycloak realm
+//!    `aud` is `"account"` for every API, so `azp` is what names the client
+//!    there. It runs after `aud` and never instead of it, so it can only shrink
+//!    the accepted set: a token here must name a trusted resource in `aud`
+//!    **and** a trusted client in `azp`. The per-issuer reasoning, and the swap
+//!    one shared list would allow, are on that field.
 //!
 //! Both middlewares run this same sequence, unchanged, on every token they are
 //! given. [`optional_auth`] does not weaken it. It only declines to demand a
@@ -221,12 +224,17 @@
 //!   issuer its good keys.
 //! - **`kid` is required.** An issuer that omits `kid` cannot be supported
 //!   without the search this crate refuses to do.
-//! - **No audience validation switch.** A token minted for another client of
-//!   the same issuer is not yours to accept.
-//! - **`azp` is opt-in, and empty means the gate is off.** An empty list is
-//!   "any client", not "no client". When it *is* configured, this crate rejects
-//!   a token that lacks `azp`. Otherwise an omitted claim would defeat the
-//!   gate.
+//! - **No audience validation switch, and no audience default.** Every issuer
+//!   names at least one audience before the process will start. A token minted
+//!   for another client of the same issuer is not yours to accept, and an issuer
+//!   that named nothing is not a policy — so it is refused rather than read as
+//!   "everything you serve".
+//! - **`azp` is opt-in per issuer, and empty means that issuer's gate is off.**
+//!   An empty list is "any client *from this issuer*", not "no client". It is
+//!   off for that issuer alone, which is what an issuer that never emits `azp`
+//!   needs: Google does not, and a gate it can never satisfy is an outage. When
+//!   an issuer does configure the gate, this crate rejects a token from that
+//!   issuer that lacks `azp`. Otherwise an omitted claim would defeat the gate.
 
 /// Compiles the README's quick-start example. Nothing else does.
 ///

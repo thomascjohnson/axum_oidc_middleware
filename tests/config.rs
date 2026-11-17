@@ -14,14 +14,15 @@ use std::time::Duration;
 use axum_oidc_middleware::{AuthConfig, AuthError, Authenticator, CachePolicy, Issuer};
 use common::{StubIssuer, TestKey};
 
-const CEILING: &str = "mycieling";
+const AUDIENCE: &str = "my-api";
 const URL: &str = "https://identity.example";
 
 /// A configuration that is valid apart from whatever a test adds to it.
+///
+/// The issuer arrives naming its own audience, which is the only way to build
+/// one that boots.
 fn config() -> AuthConfig {
-    AuthConfig::empty()
-        .with_issuer(Issuer::discover(URL).expect("valid issuer"))
-        .with_audience(CEILING)
+    AuthConfig::empty().with_issuer(Issuer::discover(URL, [AUDIENCE]).expect("valid issuer"))
 }
 
 /// The message `validate` produced, panicking if the config was accepted.
@@ -33,20 +34,6 @@ fn problem(config: &AuthConfig) -> String {
     }
 }
 
-/// An [`Issuer`] whose `iss` is not a URL.
-///
-/// Only the struct literal can reach this state. Both constructors parse `iss`
-/// as a URL first and would fail before `validate` ever saw it. The fields are
-/// public, so a caller *can* build this. That is exactly why `validate`
-/// re-checks rather than trusting where the value came from.
-fn unparseable_issuer(iss: &str) -> Issuer {
-    Issuer {
-        iss: iss.to_owned(),
-        jwks_url: None,
-        audiences: vec![],
-    }
-}
-
 // ── `Issuer` construction ────────────────────────────────────────────────────
 
 /// An issuer identifier that is not a URL cannot be discovered from, and
@@ -54,15 +41,16 @@ fn unparseable_issuer(iss: &str) -> Issuer {
 /// made rather than at the first request.
 #[test]
 fn an_issuer_that_is_not_a_url_is_refused_by_both_constructors() {
-    let discover = Issuer::discover("identity.example").expect_err("no scheme is not a URL");
+    let discover =
+        Issuer::discover("identity.example", [AUDIENCE]).expect_err("no scheme is not a URL");
     assert!(
         discover.to_string().contains("identity.example"),
         "the error should name the issuer: {discover}"
     );
 
     let keys = url::Url::parse("https://identity.example/jwks.json").expect("parse a JWKS URL");
-    let direct =
-        Issuer::with_jwks_url("identity.example", keys).expect_err("no scheme is not a URL");
+    let direct = Issuer::with_jwks_url("identity.example", keys, [AUDIENCE])
+        .expect_err("no scheme is not a URL");
     assert!(
         direct.to_string().contains("not a URL"),
         "the same rule applies with an explicit JWKS URL: {direct}"
@@ -81,7 +69,7 @@ fn an_issuer_must_not_carry_a_query_or_a_fragment() {
         "https://identity.example/callback?state=abc",
         "https://identity.example/#tenant",
     ] {
-        let err = Issuer::discover(iss).expect_err("`iss` is not a redirect target");
+        let err = Issuer::discover(iss, [AUDIENCE]).expect_err("`iss` is not a redirect target");
         assert!(
             err.to_string().contains("query or fragment"),
             "`{iss}` should be refused for its suffix: {err}"
@@ -92,13 +80,17 @@ fn an_issuer_must_not_carry_a_query_or_a_fragment() {
     // identifier that is under inspection, not the key location.
     let keys = url::Url::parse("https://identity.example/jwks.json").expect("parse a JWKS URL");
     assert!(
-        Issuer::with_jwks_url("https://identity.example?tenant=a", keys.clone())
-            .expect_err("`iss` is not a query string")
-            .to_string()
-            .contains("query or fragment")
+        Issuer::with_jwks_url(
+            "https://identity.example?tenant=a",
+            keys.clone(),
+            [AUDIENCE]
+        )
+        .expect_err("`iss` is not a query string")
+        .to_string()
+        .contains("query or fragment")
     );
     assert!(
-        Issuer::with_jwks_url("https://identity.example#tenant", keys)
+        Issuer::with_jwks_url("https://identity.example#tenant", keys, [AUDIENCE])
             .expect_err("`iss` is not a fragment")
             .to_string()
             .contains("query or fragment")
@@ -121,8 +113,7 @@ async fn an_issuer_at_a_path_is_discovered_at_that_path() {
 
     let auth = Authenticator::start(
         AuthConfig::empty()
-            .with_issuer(Issuer::discover(stub.iss()).expect("valid issuer"))
-            .with_audience(CEILING)
+            .with_issuer(Issuer::discover(stub.iss(), [AUDIENCE]).expect("valid issuer"))
             .with_insecure_http(true),
     )
     .await
@@ -131,7 +122,7 @@ async fn an_issuer_at_a_path_is_discovered_at_that_path() {
     // If the code dropped the path, discovery would answer 404 and `start`
     // would never return. This test proves that it found *this* realm's keys.
     // A token this realm signs authenticates.
-    let claims = key.sign(&key.claims(&stub.iss(), CEILING));
+    let claims = key.sign(&key.claims(&stub.iss(), AUDIENCE));
     let verified = auth
         .authenticate(&claims)
         .await
@@ -147,7 +138,7 @@ fn a_config_with_no_issuers_is_refused() {
     // This is not a locked-down deployment. It is a deployment that cannot
     // authenticate anything. It would say so with a 401 on every route, not
     // with a log line at boot.
-    let err = problem(&AuthConfig::empty().with_audience(CEILING));
+    let err = problem(&AuthConfig::empty());
     assert!(err.contains("no trusted issuers"), "{err}");
 }
 
@@ -182,18 +173,61 @@ fn a_timeout_short_enough_to_always_fail_is_refused() {
 }
 
 #[test]
-fn an_issuer_that_is_not_a_url_is_refused_by_validate_too() {
-    // `Issuer`'s own constructors parse `iss`, so this shape only arrives
-    // through the public fields. `validate` checks anyway, because it is the
-    // last gate before the value is trusted.
-    let err = problem(&config().with_issuer(unparseable_issuer("identity.example")));
+fn an_issuer_cannot_be_assembled_around_its_constructors() {
+    // This test used to assemble an `Issuer` whose `iss` skipped `Url::parse`
+    // through the public fields, to prove `validate` re-checks anyway. Struct
+    // literals are closed now: `audiences` and `authorized_parties` are private,
+    // and one private field is enough to refuse a literal from another module.
+    // So both constructors always run their parse before an `Issuer` exists.
+    //
+    // The trade is real and is stated on `Issuer`: a host that assembled one
+    // from its own config type now calls `discover` or `with_jwks_url`, both of
+    // which take the audiences that used to be left out.
+    AuthConfig::empty()
+        .with_issuer(Issuer::discover(URL, [AUDIENCE]).expect("valid issuer"))
+        .validate()
+        .expect("the only reachable shape is a well-formed one");
+
+    // What a caller can still get wrong is the set itself. Arity forces it to
+    // be addressed; `[]` addresses it with nothing, and the constructor refuses
+    // that rather than handing back an issuer that only fails at boot. So the
+    // mistake surfaces on the line that made it.
+    let silent = Issuer::discover(URL, Vec::<String>::new())
+        .expect_err("naming no audience is not an issuer");
+    let reason = silent.to_string();
+    assert!(
+        reason.contains("names no audiences") && reason.contains(URL),
+        "the refusal should name the issuer that said nothing: {reason}"
+    );
+}
+
+/// The one route the private audience list did **not** close.
+///
+/// A literal cannot be written from outside the crate, but `iss` is still `pub`,
+/// so a caller can assign a value the constructors never parsed:
+///
+/// ```ignore
+/// let mut issuer = Issuer::discover(URL, ["my-api"])?;
+/// issuer.iss = "identity.example".to_owned(); // skips `Url::parse`
+/// ```
+///
+/// That leaves `validate` — not the constructor — as the last gate for a
+/// mutated value, which is why it re-checks rather than trusting where the
+/// value came from. This test exists because the shape above argues the route is
+/// gone, and a claim like that needs a test standing behind it.
+#[test]
+fn validate_still_rechecks_an_issuer_mutated_after_construction() {
+    let mut unparseable = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
+    unparseable.iss = "identity.example".to_owned(); // the scheme went missing
+    let err = problem(&AuthConfig::empty().with_issuer(unparseable));
     assert!(err.contains("is not a URL"), "{err}");
 
-    // And an empty one, which has the same problem in a quieter form.
-    let empty = problem(&config().with_issuer(unparseable_issuer("")));
+    let mut empty = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
+    empty.iss = String::new();
+    let err = problem(&AuthConfig::empty().with_issuer(empty));
     assert!(
-        empty.contains("issuer is empty"),
-        "an empty issuer should be named as such: {empty}"
+        err.contains("issuer is empty"),
+        "an emptied issuer should be named as such: {err}"
     );
 }
 
@@ -204,16 +238,8 @@ fn the_same_issuer_listed_twice_is_refused() {
     // JWKS URL and one without. Boot has to say which one the operator meant.
     let err = problem(
         &config()
-            .with_issuer(
-                Issuer::discover(URL)
-                    .expect("valid issuer")
-                    .audience(CEILING),
-            )
-            .with_issuer(
-                Issuer::discover(URL)
-                    .expect("valid issuer")
-                    .audience(CEILING),
-            ),
+            .with_issuer(Issuer::discover(URL, [AUDIENCE]).expect("valid issuer"))
+            .with_issuer(Issuer::discover(URL, [AUDIENCE]).expect("valid issuer")),
     );
     assert!(
         err.contains("listed twice") && err.contains(URL),
@@ -229,9 +255,9 @@ fn the_same_issuer_listed_twice_is_refused() {
 /// [`cleartext_on_a_public_host_stays_refused_when_the_flag_is_set`].
 #[test]
 fn cleartext_is_refused_unless_it_is_explicitly_allowed() {
-    let http_issuer = AuthConfig::empty()
-        .with_issuer(Issuer::discover("http://identity.example").expect("valid issuer"))
-        .with_audience(CEILING);
+    let http_issuer = AuthConfig::empty().with_issuer(
+        Issuer::discover("http://identity.example", [AUDIENCE]).expect("valid issuer"),
+    );
 
     let err = problem(&http_issuer);
     assert!(err.contains("requires https"), "{err}");
@@ -243,12 +269,7 @@ fn cleartext_is_refused_unless_it_is_explicitly_allowed() {
     // Same decision, taken once, applied to the key endpoint as well.
     let keys = url::Url::parse("http://identity.example/jwks.json").expect("parse a JWKS URL");
     let http_keys = AuthConfig::empty()
-        .with_issuer(
-            Issuer::with_jwks_url(URL, keys)
-                .expect("valid issuer")
-                .audience(CEILING),
-        )
-        .with_audience(CEILING);
+        .with_issuer(Issuer::with_jwks_url(URL, keys, [AUDIENCE]).expect("valid issuer"));
 
     let err = problem(&http_keys);
     assert!(err.contains("JWKS URL") && err.contains("https"), "{err}");
@@ -275,11 +296,8 @@ fn cleartext_on_a_public_host_stays_refused_when_the_flag_is_set() {
     let err = problem(
         &AuthConfig::empty()
             .with_issuer(
-                Issuer::discover("http://identity.example")
-                    .expect("valid issuer")
-                    .audience(CEILING),
+                Issuer::discover("http://identity.example", [AUDIENCE]).expect("valid issuer"),
             )
-            .with_audience(CEILING)
             .with_insecure_http(true),
     );
     assert!(
@@ -298,12 +316,7 @@ fn cleartext_on_a_public_host_stays_refused_when_the_flag_is_set() {
     let keys = url::Url::parse("http://keys.example/jwks.json").expect("parse a JWKS URL");
     let err = problem(
         &AuthConfig::empty()
-            .with_issuer(
-                Issuer::with_jwks_url(URL, keys)
-                    .expect("valid issuer")
-                    .audience(CEILING),
-            )
-            .with_audience(CEILING)
+            .with_issuer(Issuer::with_jwks_url(URL, keys, [AUDIENCE]).expect("valid issuer"))
             .with_insecure_http(true),
     );
     assert!(
@@ -321,11 +334,9 @@ fn cleartext_on_a_public_host_stays_refused_when_the_flag_is_set() {
         let err = problem(
             &AuthConfig::empty()
                 .with_issuer(
-                    Issuer::discover(format!("http://{host}/realms/demo"))
-                        .expect("valid issuer")
-                        .audience(CEILING),
+                    Issuer::discover(format!("http://{host}/realms/demo"), [AUDIENCE])
+                        .expect("valid issuer"),
                 )
-                .with_audience(CEILING)
                 .with_insecure_http(true),
         );
         assert!(
@@ -349,12 +360,7 @@ fn cleartext_is_allowed_for_every_loopback_spelling() {
         "http://[::1]:43117/realms/demo",
     ] {
         let config = AuthConfig::empty()
-            .with_issuer(
-                Issuer::discover(iss)
-                    .expect("valid issuer")
-                    .audience(CEILING),
-            )
-            .with_audience(CEILING)
+            .with_issuer(Issuer::discover(iss, [AUDIENCE]).expect("valid issuer"))
             .with_insecure_http(true);
 
         config
@@ -364,11 +370,7 @@ fn cleartext_is_allowed_for_every_loopback_spelling() {
 
     // Setting the flag does not put the other rules to sleep. A config with no
     // issuer is still refused.
-    let err = problem(
-        &AuthConfig::empty()
-            .with_audience(CEILING)
-            .with_insecure_http(true),
-    );
+    let err = problem(&AuthConfig::empty().with_insecure_http(true));
     assert!(
         err.contains("no trusted issuers"),
         "an empty issuer list is still refused: {err}"
@@ -384,13 +386,9 @@ fn cleartext_is_allowed_for_every_loopback_spelling() {
 #[test]
 fn a_url_with_no_host_is_not_loopback() {
     let hostless = || {
-        AuthConfig::empty()
-            .with_issuer(
-                Issuer::discover("file:///var/lib/oidc/jwks.json")
-                    .expect("valid issuer")
-                    .audience(CEILING),
-            )
-            .with_audience(CEILING)
+        AuthConfig::empty().with_issuer(
+            Issuer::discover("file:///var/lib/oidc/jwks.json", [AUDIENCE]).expect("valid issuer"),
+        )
     };
 
     let err = problem(&hostless().with_insecure_http(true));
@@ -418,25 +416,18 @@ fn a_url_with_no_host_is_not_loopback() {
 fn loopback_config() -> AuthConfig {
     let keys =
         url::Url::parse("http://127.0.0.1:43117/realms/demo/jwks.json").expect("parse a JWKS URL");
-    AuthConfig::empty()
-        .with_issuer(
-            Issuer::with_jwks_url("http://127.0.0.1:43117/realms/demo", keys)
-                .expect("valid issuer")
-                .audience(CEILING),
-        )
-        .with_audience(CEILING)
+    AuthConfig::empty().with_issuer(
+        Issuer::with_jwks_url("http://127.0.0.1:43117/realms/demo", keys, [AUDIENCE])
+            .expect("valid issuer"),
+    )
 }
 
 #[test]
 fn an_issuer_configured_with_an_empty_audience_is_refused() {
-    // `--issuer-audience example.com=` would be a filter nothing can satisfy.
-    // No token names an empty audience, so every caller of that issuer is
-    // locked out by a setting that reads as though it permitted something.
-    let err = problem(
-        &config()
-            .with_audience("")
-            .with_issuer(Issuer::discover(URL).expect("valid issuer").audience("")),
-    );
+    // `Issuer::discover(URL, [""])` names a blank audience. No token ever
+    // carries one, so every caller of that issuer is locked out by a setting
+    // that reads as though it permitted something.
+    let err = problem(&config().with_issuer(Issuer::discover(URL, [""]).expect("valid issuer")));
     assert!(
         err.contains("configured with an empty audience") && err.contains(URL),
         "the refusal should name the issuer whose audience is blank: {err}"
@@ -452,18 +443,26 @@ fn an_issuer_configured_with_an_empty_audience_is_refused() {
 fn validate_reports_every_problem_at_once() {
     let err = problem(
         &AuthConfig::empty()
-            .with_issuer(Issuer::discover("http://identity.example").expect("valid issuer"))
+            .with_issuer(
+                Issuer::discover("http://identity.example", [AUDIENCE]).expect("valid issuer"),
+            )
             .with_algorithms([])
-            .with_authorized_parties([String::new()])
-            .with_audience(CEILING)
-            .with_issuer(Issuer::discover(URL).expect("valid issuer")),
+            // One issuer, two problems: the audience it named is blank, and so
+            // is the client it named. An empty *set* would be a third, but the
+            // constructor refuses that one before `validate` ever sees it, so
+            // this is the audience problem `validate` still owns.
+            .with_issuer(
+                Issuer::discover(URL, [""])
+                    .expect("valid issuer")
+                    .authorized_party(String::new()),
+            ),
     );
 
     for expected in [
         "no allowed signature algorithms",
-        "empty string",
+        "empty authorised party",
         "requires https",
-        "names no audiences",
+        "configured with an empty audience",
     ] {
         assert!(err.contains(expected), "missing `{expected}` from: {err}");
     }
@@ -484,10 +483,10 @@ fn the_default_config_is_the_empty_config() {
 
     assert!(default.issuers.is_empty(), "nothing is trusted by default");
     assert!(
-        default.audiences().is_empty(),
+        default.all_audiences().is_empty(),
         "no audience is servable by default"
     );
-    assert!(default.authorized_parties.is_empty());
+    assert!(default.all_authorized_parties().is_empty());
     assert_eq!(default.leeway, 30);
     assert!(!default.allow_insecure_http);
 

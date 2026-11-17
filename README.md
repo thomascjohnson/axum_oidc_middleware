@@ -17,19 +17,21 @@ use axum_oidc_middleware::{AuthConfig, AuthUser, Authenticator, Issuer, require_
 use axum::{middleware, routing::post, Router};
 
 async fn app() -> Result<Router, axum_oidc_middleware::AuthError> {
-    // Build the config through the chain. The fields are private, so this
-    // chain cannot leave `audiences` empty by omission.
-    let config = AuthConfig::empty()
-        .with_issuers([
-            Issuer::discover("https://accounts.google.com")?,
-            Issuer::discover("https://sso.example.com/realms/myapp")?,
-        ])
-        // Required. Nothing turns audience verification off.
-        .with_audience("myapp")
-        // Optional. Keycloak's stock `aud` is "account" for every API, so name
-        // the client here too. This crate verifies `azp` in addition to the
-        // audience, never instead of it.
-        .with_authorized_parties(["myapp-client"]);
+    // Each issuer names the audiences its own tokens may carry, as it is
+    // built. There is no deployment-wide audience list for an issuer to
+    // inherit, so a second issuer cannot quietly pick up the first one's
+    // audience.
+    let config = AuthConfig::empty().with_issuers([
+        // Google never makes an `azp` claim, so this issuer names no client.
+        // Its `azp` gate is off, and off for this issuer alone.
+        Issuer::discover("https://accounts.google.com", ["myapp"])?,
+        // Keycloak's stock `aud` is "account" for every API, so name the client
+        // here too. This crate verifies `azp` in addition to the audience,
+        // never instead of it. It goes on the issuer because a client id is
+        // unique within a realm, not across realms.
+        Issuer::discover("https://sso.example.com/realms/myapp", ["myapp"])?
+            .authorized_party("myapp-client"),
+    ]);
 
     // This call fails now if an issuer is unreachable or its keys will not load.
     let auth = Authenticator::start(config).await?;

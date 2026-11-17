@@ -124,9 +124,9 @@ pub struct Issuer {
     /// Where to fetch keys. `None` means discover the location from
     /// `<iss>/.well-known/openid-configuration`.
     pub jwks_url: Option<Url>,
-    /// The `aud` values that a token *from this issuer* may name.
+    /// The `aud` values that a token *from this issuer* may name. Required.
     ///
-    /// # Why the audience set is per issuer
+    /// # Why this list is per issuer, and why it has no default
     ///
     /// Trusting several issuers is a union, and a union at this layer is the
     /// vulnerability, not the feature. With one flat list shared by every
@@ -137,17 +137,70 @@ pub struct Issuer {
     /// property of the issuer that signed it. So the list is stated here rather
     /// than beside the others.
     ///
-    /// Every entry must also appear in [`AuthConfig::audiences`], which is the
-    /// ceiling. This list only narrows within it
-    /// ([`AuthConfig::issuer_audiences`]).
+    /// And it is stated *here*, because a list beside the others is a default,
+    /// and a default is what makes the mistake invisible. There is no global
+    /// audience set that an issuer inherits when it says nothing, so the
+    /// question "which audiences does this issuer serve?" always has exactly
+    /// one answer in the configuration, and reading it never requires knowing
+    /// how many other issuers exist.
     ///
-    /// Empty means "the whole ceiling". [`AuthConfig::validate`] allows that
-    /// for a lone issuer: with one issuer the ceiling *is* its audience set, so
-    /// existing single-issuer deployments need no new setting. Validation
-    /// refuses it for a second issuer. Leaving an issuer unspecified in a
-    /// multi-issuer topology is exactly the confusion this field exists to
-    /// close.
-    pub audiences: Vec<String>,
+    /// Three things keep the unspecified state out. Both constructors take the
+    /// set as a required argument, so an issuer that names no audience is a
+    /// missing argument at the call site rather than a value that compiles.
+    /// Both also refuse an empty iterator, so `Issuer::discover(iss, [])` is an
+    /// error instead of an issuer that fails later — arity cannot see into an
+    /// iterator, and this is the check arity cannot make. And the field is
+    /// private, so no literal can be assembled around them.
+    /// [`AuthConfig::validate`] repeats the check anyway, for the literals this
+    /// module's own tests build.
+    audiences: Vec<String>,
+    /// The `azp` values that a token *from this issuer* may name. Optional.
+    ///
+    /// # Why this list is per issuer
+    ///
+    /// The same argument as [`Self::audiences()`], with a sharper edge. `azp`
+    /// names a *client*, and a client id is unique within a realm, not across
+    /// realms. Two Keycloak realms you trust can each carry a client called
+    /// `my-app`. A single list shared by both therefore accepts a token minted
+    /// for `my-app` in realm B at an API that means `my-app` in realm A. The
+    /// `aud` layer above cannot catch this: in a stock realm `aud` is
+    /// `"account"` for every API, so the two tokens look identical there.
+    ///
+    /// So `azp` is scoped to its issuer here too, and there is no global list
+    /// to fall back on.
+    ///
+    /// # Why it is additive, and how it is off
+    ///
+    /// Keycloak sets `azp` to the `client_id` that requested the token, always,
+    /// with no configuration. Its `aud` is a different story. The built-in
+    /// `roles` client scope carries an "Audience Resolve" mapper. That mapper
+    /// fills `aud` from the clients the user holds client roles on, so a stock
+    /// realm produces `aud: ["account"]` for *every* API. Matching on `aud`
+    /// alone then either rejects every legitimate caller or forces you to
+    /// accept `"account"`, which distinguishes nothing.
+    ///
+    /// This crate enforces `azp` *in addition to* `aud`, never instead of it,
+    /// and `aud` stays mandatory. There is no configuration in which satisfying
+    /// either claim is enough. An OR over two identity fields is satisfied by
+    /// whichever one the attacker's token happens to carry. A token here must
+    /// name a trusted resource in `aud` **and** a trusted client in `azp`.
+    ///
+    /// Empty turns the gate off for this issuer alone, which is what an issuer
+    /// that does not emit `azp` at all needs — Google does not, and a gate it
+    /// can never satisfy is an outage. Where one deployment trusts both a
+    /// Keycloak realm and Google, Keycloak can be gated and Google left alone,
+    /// because the gate is per issuer.
+    ///
+    /// When the gate is on for an issuer, this crate rejects a token from that
+    /// issuer with no `azp` claim rather than skipping the gate. A gate that
+    /// absence can bypass is not a gate.
+    ///
+    /// Where you control the realm, the better fix is to give `aud` a real
+    /// value with an audience mapper and leave this list empty. RFC 9068 makes
+    /// `aud` required of a JWT access token and does not define `azp` at all.
+    /// This option is Keycloak-shaped pragmatism, not a substitute for doing
+    /// that.
+    authorized_parties: Vec<String>,
 }
 
 impl Issuer {
@@ -155,18 +208,31 @@ impl Issuer {
     ///
     /// The crate compares the discovery document's own `issuer` with `iss` at
     /// startup, so a document served by the wrong realm fails fast.
-    pub fn discover(iss: impl Into<String>) -> Result<Self, AuthError> {
+    ///
+    /// `audiences` is required, and there is no way to ask for an issuer
+    /// without naming it — see [`Issuer::audiences()`]. Add more later with
+    /// [`Self::audience`], and gate on `azp` with [`Self::authorized_party`].
+    pub fn discover(
+        iss: impl Into<String>,
+        audiences: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, AuthError> {
         let iss = iss.into();
         let url = Url::parse(&iss).map_err(|err| {
             AuthError::Configuration(format!("issuer `{iss}` is not a URL: {err}"))
         })?;
-        Self::new(iss, url, None)
+        Self::new(iss, url, None, audiences)
     }
 
     /// Skip discovery and name the JWKS endpoint directly. Use this for an
     /// issuer with no discovery document, or to keep discovery off the network
     /// path.
-    pub fn with_jwks_url(iss: impl Into<String>, jwks_url: Url) -> Result<Self, AuthError> {
+    ///
+    /// `audiences` is required for the same reason [`Self::discover`] takes it.
+    pub fn with_jwks_url(
+        iss: impl Into<String>,
+        jwks_url: Url,
+        audiences: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, AuthError> {
         let iss = iss.into();
         Self::new(
             iss.clone(),
@@ -174,12 +240,18 @@ impl Issuer {
                 AuthError::Configuration(format!("issuer `{iss}` is not a URL: {err}"))
             })?,
             Some(jwks_url),
+            audiences,
         )
     }
 
     /// Both the issuer and its keys must use HTTPS: these answers establish
     /// trust, and HTTP lets anyone on the path answer them.
-    fn new(iss: String, url: Url, jwks_url: Option<Url>) -> Result<Self, AuthError> {
+    fn new(
+        iss: String,
+        url: Url,
+        jwks_url: Option<Url>,
+        audiences: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, AuthError> {
         if iss.is_empty() {
             return Err(AuthError::Configuration("issuer is empty".to_owned()));
         }
@@ -192,26 +264,63 @@ impl Issuer {
                 "issuer `{iss}` must not carry a query or fragment"
             )));
         }
+        // Arity cannot see inside an iterator, so `[]` reaches here. An empty
+        // set is the *unspecified* state, not a settled one, and once there is
+        // no deployment-wide list to inherit it has no reading but "any
+        // audience". So it is refused here, at the only point that can see it,
+        // rather than left for `validate` to catch after a caller already holds
+        // an `Issuer` that looks fine.
+        let audiences: Vec<String> = audiences.into_iter().map(Into::into).collect();
+        if audiences.is_empty() {
+            return Err(AuthError::Configuration(format!(
+                "issuer `{iss}` names no audiences; every trusted issuer must state \
+                 the audiences its own tokens may carry — `Issuer::discover(iss, \
+                 [AUDIENCE])` — because an issuer that names nothing and accepts \
+                 everything lets a token minted for one purpose authenticate as any \
+                 other"
+            )));
+        }
+
         Ok(Self {
             iss,
             jwks_url,
-            // Empty here is the *unspecified* state, not a settled one. It
-            // survives `validate` only when this is the only issuer, where it
-            // means "accept the whole ceiling".
-            audiences: Vec::new(),
+            // Non-empty by construction, so this line needs no note about an
+            // unspecified state: there is no such value to hold here.
+            audiences,
+            // Empty is settled: it means the `azp` gate is off for this issuer.
+            authorized_parties: Vec::new(),
         })
     }
 
     /// Add one more `aud` for this issuer's tokens. Repeatable.
     ///
-    /// Naming an audience that is not in [`AuthConfig::audiences`] is a
-    /// startup error rather than a silent narrowing. The request path
-    /// intersects the two lists, so such an entry could never match a real
-    /// token. A deployment whose callers can never satisfy it is an outage
-    /// waiting to be mistaken for a bug in the client.
+    /// This cannot create an issuer and cannot empty one, so it only ever adds
+    /// to a set the constructors already required to be stated and already
+    /// refused to leave blank.
     pub fn audience(mut self, aud: impl Into<String>) -> Self {
         self.audiences.push(aud.into());
         self
+    }
+
+    /// Add one more accepted `azp` for this issuer's tokens. Repeatable.
+    ///
+    /// The first call turns the gate on for *this issuer*; each one after admits
+    /// another client. It cannot gate any other issuer — see
+    /// [`Issuer::authorized_parties()`].
+    pub fn authorized_party(mut self, azp: impl Into<String>) -> Self {
+        self.authorized_parties.push(azp.into());
+        self
+    }
+
+    /// The `aud` values a token from this issuer may name.
+    pub fn audiences(&self) -> &[String] {
+        &self.audiences
+    }
+
+    /// The `azp` values a token from this issuer may name, empty when that
+    /// issuer's gate is off.
+    pub fn authorized_parties(&self) -> &[String] {
+        &self.authorized_parties
     }
 
     /// Return `<iss>/.well-known/openid-configuration`, per RFC 8414 §3.1.
@@ -239,85 +348,44 @@ impl Issuer {
 
 /// Everything needed to authenticate requests.
 ///
-/// # Built with `empty()` and `with_*`, not a struct literal
+/// # Built with `empty()` and `with_*`
 ///
 /// Describe a deployment with [`AuthConfig::empty`] and then one
-/// [`Self::with_audience`], [`Self::with_issuer`], [`Self::with_algorithms`],
-/// and so on per setting. That is the same shape [`Issuer`] uses. Functional
-/// record update (`AuthConfig { issuers, ..AuthConfig::empty() }`) no longer
-/// compiles, even for a site that names no audiences:
+/// [`Self::with_issuer`], [`Self::with_algorithms`], and so on per setting.
+///
+/// # Where the trust scope lives
+///
+/// `AuthConfig` has no audience field and no `azp` field. Both are stated on the
+/// issuer they describe — [`Issuer::audiences()`] and
+/// [`Issuer::authorized_parties()`], where the reasoning for that split lives.
+/// [`Self::all_audiences()`] and [`Self::all_authorized_parties()`] derive a
+/// union for reporting; neither is a second setting that could disagree with the
+/// issuers.
+///
+/// What enforces the rule is the shape of [`Issuer`], not a field here. An
+/// `Issuer` cannot be built without naming its audiences, and cannot be built
+/// as a literal at all:
 ///
 /// ```compile_fail
-/// use axum_oidc_middleware::{AuthConfig, Issuer};
+/// use axum_oidc_middleware::Issuer;
 ///
-/// let config = AuthConfig {
-///     issuers: vec![Issuer::discover("https://identity.example").unwrap()],
-///     ..AuthConfig::empty()
+/// let issuer = Issuer {
+///     iss: "https://identity.example".to_owned(),
+///     jwks_url: None,
+///     audiences: vec![],
+///     authorized_parties: vec![],
 /// };
 /// ```
 ///
-/// Record update requires *every* field to be visible at the site, and the
-/// audience ceiling is deliberately not visible. So the shape of the type now
-/// enforces the rule the ceiling exists to hold. No `AuthConfig` reaches the
-/// verifier before its caller names an audience set through
-/// [`Self::with_audience`]. The per-issuer lists are then compared against it.
-/// The cost is real: every construction goes through the builders. The cost is
-/// accepted, because the alternative is a public field that can be left out of
-/// a literal by accident.
+/// Functional record update on `AuthConfig` still compiles, and that is fine:
+/// every field it can carry is safe to write, and an `Issuer` in that vector
+/// has already had to say what it serves.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
     /// Trusted issuers. Must not be empty. Each issuer carries the audiences
-    /// its own tokens may name — see [`Issuer::audiences`].
+    /// its own tokens may name, and optionally the clients — see
+    /// [`Issuer::audiences()`] and [`Issuer::authorized_parties()`].
     pub issuers: Vec<Issuer>,
-    /// The audience **ceiling**: every `aud` any issuer may ever be accepted
-    /// for. Required. The audience gate cannot be turned off.
-    ///
-    /// Without a ceiling at all, this crate accepts a token minted for any
-    /// other client of the same issuer. That makes the issuer's whole client
-    /// roster part of your trust boundary. With a ceiling but no per-issuer
-    /// lists, every issuer serves every audience in it. That is why
-    /// [`Issuer::audiences`] is mandatory as soon as a second issuer appears.
-    ///
-    /// # Why it is private
-    ///
-    /// The old public `audiences: Vec<String>` was the flattened union that
-    /// made one issuer able to vouch for another's audience, so the shape is
-    /// gone rather than repurposed. Reads go through [`Self::audiences`] and
-    /// writes through [`Self::with_audience`]. A per-issuer list can only be
-    /// read back as [`Self::issuer_audiences`] — narrowed by this field. There
-    /// is no longer a way to hand the verifier an audience set that the ceiling
-    /// does not already cover.
-    audiences: Vec<String>,
-    /// Accepted `azp` (authorised party) values — the client that asked for
-    /// the token. Empty means the gate is off, which is the default.
-    ///
-    /// # Why this exists, and why it is additive
-    ///
-    /// Keycloak sets `azp` to the `client_id` that requested the token, always,
-    /// with no configuration. Its `aud` is a different story. The built-in
-    /// `roles` client scope carries an "Audience Resolve" mapper. That mapper
-    /// fills `aud` from the clients the user holds client roles on, so a stock
-    /// realm produces `aud: ["account"]` for *every* API. Matching on `aud`
-    /// alone then either rejects every legitimate caller or forces you to
-    /// accept `"account"`, which distinguishes nothing.
-    ///
-    /// So this crate enforces `azp` *in addition to* `aud`, never instead of
-    /// it, and `aud` stays mandatory. There is no configuration in which
-    /// satisfying either claim is enough. An OR over two identity fields is
-    /// satisfied by whichever one the attacker's token happens to carry. A
-    /// token here must name a trusted resource in `aud` **and** a trusted
-    /// client in `azp`.
-    ///
-    /// When you configure `azp`, this crate rejects a token with no `azp` claim
-    /// rather than skipping the gate. A gate that absence can bypass is not a
-    /// gate.
-    ///
-    /// Where you control the realm, the better fix is to give `aud` a real
-    /// value with an audience mapper and leave this list empty. RFC 9068 makes
-    /// `aud` required of a JWT access token and does not define `azp` at all.
-    /// This option is Keycloak-shaped pragmatism, not a substitute for doing
-    /// that.
-    pub authorized_parties: Vec<String>,
     /// Accepted signing algorithms. Defaults to RS256 alone.
     pub algorithms: Vec<SignatureAlgorithm>,
     /// Clock skew tolerance in seconds, applied to `exp` and `nbf`.
@@ -352,6 +420,26 @@ pub struct AuthConfig {
     pub allow_insecure_http: bool,
 }
 
+/// Flatten a sequence of per-issuer lists into one union, keeping the first
+/// occurrence of each value and therefore preserving issuer order.
+///
+/// Used only for the derived readbacks on [`AuthConfig`], never to decide that
+/// a token is trusted. Order is stable so `audiences()` reads the same way
+/// across runs, which matters in a startup log line and in test failures.
+///
+/// Takes the values rather than an `Issuer` and a way to pick a field off it.
+/// The only two callers differ in which field they flatten, and that is a
+/// question `flat_map` already answers at the call site.
+fn union_of<'a>(values: impl IntoIterator<Item = &'a String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values {
+        if !out.contains(value) {
+            out.push(value.clone());
+        }
+    }
+    out
+}
+
 /// Whether `url` names a host that can only be this machine.
 ///
 /// The whole of `127.0.0.0/8` counts, not `127.0.0.1` alone. That block is
@@ -374,13 +462,11 @@ fn is_loopback(url: &Url) -> bool {
 }
 
 impl AuthConfig {
-    /// Trust nothing. Validation fails until an issuer exists and a ceiling is
-    /// named.
+    /// Trust nothing. Validation fails until an issuer exists, and every
+    /// issuer states the audiences it serves.
     pub fn empty() -> Self {
         Self {
             issuers: Vec::new(),
-            audiences: Vec::new(),
-            authorized_parties: Vec::new(),
             algorithms: vec![SignatureAlgorithm::default()],
             leeway: 30,
             policy: CachePolicy::default(),
@@ -388,23 +474,12 @@ impl AuthConfig {
         }
     }
 
-    /// Add one audience to the ceiling.
-    ///
-    /// This widens the set, and it is deliberately spelled as an action. An
-    /// issuer can only ever narrow what this list allows. So the only way to
-    /// accept a new `aud` anywhere is to say so here.
-    pub fn with_audience(mut self, aud: impl Into<String>) -> Self {
-        self.audiences.push(aud.into());
-        self
-    }
-
     /// Trust one more issuer. Repeatable.
     ///
-    /// The issuer carries the audiences *its own* tokens may name — see
-    /// [`Issuer::audience`]. So an issuer added without any is a statement that
-    /// it is served by the whole ceiling. [`Self::validate`] permits that for a
-    /// lone issuer and refuses it for a second one. That is the point of making
-    /// each issuer say so rather than sharing one list.
+    /// The issuer arrives already carrying the audiences *its own* tokens may
+    /// name, because [`Issuer::discover`] will not return one that names none.
+    /// There is no call on [`AuthConfig`] that supplies an audience to an
+    /// issuer which did not ask for one.
     pub fn with_issuer(mut self, issuer: Issuer) -> Self {
         self.issuers.push(issuer);
         self
@@ -418,21 +493,6 @@ impl AuthConfig {
     /// already reach.
     pub fn with_issuers(mut self, issuers: impl IntoIterator<Item = Issuer>) -> Self {
         self.issuers.extend(issuers);
-        self
-    }
-
-    /// Accept `azp` from one more client. Repeatable.
-    ///
-    /// The empty list means the gate is off, so this only ever narrows. The
-    /// first call turns the gate on, and every one after it admits another
-    /// client alongside the rest. See [`Self::authorized_parties`] for why
-    /// `azp` narrows `aud` rather than standing in for it.
-    pub fn with_authorized_parties(
-        mut self,
-        parties: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.authorized_parties
-            .extend(parties.into_iter().map(Into::into));
         self
     }
 
@@ -479,41 +539,42 @@ impl AuthConfig {
         self
     }
 
-    /// The ceiling: every `aud` any issuer may be accepted for.
+    /// Every `aud` any configured issuer serves: the union over the issuers, in
+    /// issuer order, deduplicated.
     ///
-    /// This answers "is this audience servable at all". It is *not* the answer
-    /// to "is this audience servable for this issuer". That answer is
-    /// [`Self::issuer_audiences`], and a token has to satisfy both.
-    pub fn audiences(&self) -> &[String] {
-        &self.audiences
+    /// The `all_` prefix is doing work. This is the deployment-wide answer, and
+    /// it reads against the per-issuer one,
+    /// [`Issuer::audiences()`](Issuer::audiences), which is what decides whether
+    /// a particular token may name a particular audience. There is no
+    /// deployment-wide *setting* for this to silently disagree with: the value is
+    /// derived, so it can only contain an audience some issuer named, and it
+    /// contains every one of those.
+    ///
+    /// Two consumers. The verifier's base validation hands it to `jsonwebtoken`'s
+    /// audience gate, the outer of the two gates — a union is right there because
+    /// it is the widest set the deployment ever intended, and the narrow question
+    /// is answered after the signature by the per-issuer set. A host also logs it
+    /// at startup. Neither reads it as permission for one token.
+    pub fn all_audiences(&self) -> Vec<String> {
+        union_of(self.issuers.iter().flat_map(|issuer| &issuer.audiences))
     }
 
-    /// The audiences a token from `issuer` may name: `issuer`'s own list,
-    /// narrowed by [`Self::audiences`].
+    /// Every `azp` named by any configured issuer, empty when no issuer gates
+    /// on `azp`.
     ///
-    /// # Why the narrowing cannot be skipped, or escaped
-    ///
-    /// Both branches return a subset of the ceiling, and neither is a rule a
-    /// caller has to remember:
-    ///
-    /// * `issuer.audiences`, because [`Self::validate`] refuses the one shape
-    ///   that could name an audience outside the ceiling. So after validation,
-    ///   the intersection and the list are the same set.
-    /// * the ceiling itself for the lone issuer that named nothing, which by
-    ///   definition contains it.
-    ///
-    /// Returning a borrow is the point. The request path reads this, and
-    /// intersect-then-clone per request would allocate to recompute a set that
-    /// cannot change after startup. [`Authenticator::start`](crate::Authenticator::start)
-    /// therefore intersects once per issuer and keeps the result. So the
-    /// verifier enforces a value that came out of intersection, even if some
-    /// caller hand-built an [`Authenticator`](crate::Authenticator) without
-    /// validating.
-    pub fn issuer_audiences<'a>(&'a self, issuer: &'a Issuer) -> &'a [String] {
-        if issuer.audiences.is_empty() {
-            return &self.audiences;
-        }
-        &issuer.audiences
+    /// Reporting only. Nothing enforces this list: an entry is accepted only
+    /// from the issuer that named it, which is the pairing
+    /// [`Issuer::authorized_parties()`](Issuer::authorized_parties) carries. The
+    /// `all_` prefix is the warning label rather than decoration. One list of
+    /// accepted clients, consulted for every issuer, is what let a client id
+    /// from one realm pass at another. This accessor aggregates for a log line
+    /// and never for a decision.
+    pub fn all_authorized_parties(&self) -> Vec<String> {
+        union_of(
+            self.issuers
+                .iter()
+                .flat_map(|issuer| &issuer.authorized_parties),
+        )
     }
 
     /// Return why the crate must not fetch `url` for its trust anchors. Return
@@ -584,19 +645,8 @@ impl AuthConfig {
         if self.issuers.is_empty() {
             problems.push("no trusted issuers configured".to_owned());
         }
-        if self.audiences.iter().any(String::is_empty) || self.audiences.is_empty() {
-            problems.push(
-                "no non-empty audience configured; audience checking cannot be disabled".to_owned(),
-            );
-        }
         if self.algorithms.is_empty() {
             problems.push("no allowed signature algorithms".to_owned());
-        }
-        // A blank in this list would be a gate that can never pass, which is
-        // an outage disguised as a security control.
-        if self.authorized_parties.iter().any(String::is_empty) {
-            problems
-                .push("an authorised party (`azp`) is configured as an empty string".to_owned());
         }
         if self.leeway > MAX_LEEWAY_SECS {
             problems.push(format!(
@@ -645,52 +695,49 @@ impl AuthConfig {
                 problems.push(problem);
             }
 
-            // ── This issuer's slice of the audience ceiling ──────────────────
+            // ── This issuer's own scope ──────────────────────────────────────
             //
-            // Two rules, both decided at boot because both are invisible at
-            // request time:
+            // Three rules, all decided at boot because all are invisible at
+            // request time. Each one is stated per issuer, since there is no
+            // deployment-wide list left to check an issuer against.
             //
-            // * An entry outside the ceiling could never match. The verifier
-            //   intersects each issuer's list with the ceiling, so a stray
-            //   `aud` here describes a caller that can never be authenticated.
-            //   Refuse the configuration instead of shipping a filter nothing
-            //   can satisfy.
-            // * Naming nothing is tolerable for the only issuer and forbidden
-            //   for a second one. With one issuer the ceiling already *is* its
-            //   audience set. That covers every deployment that predates this
-            //   field, so asking it to restate the obvious buys nothing. With
-            //   two, an unspecified issuer accepts the whole ceiling, which
-            //   re-creates the exact cross-issuer confusion the per-issuer
-            //   layer exists to close. So that topology must state what each
-            //   issuer is for, and state it before serving a request.
+            // * Naming no audience is refused for *every* issuer, not merely a
+            //   second one. There is no ceiling left for an unspecified issuer
+            //   to fall back on, and "no audience" read as "any audience" is
+            //   the vulnerability the per-issuer list exists to close. The
+            //   constructors already refuse an empty iterator, so this is the
+            //   backstop for the field-by-field literals this module's tests
+            //   build — the one shape a private field still permits, in here.
+            // * A blank entry could never match, which is an outage disguised
+            //   as a security control.
+            // * `azp` is scoped the same way. Its blank check moved here from
+            //   the deployment-wide list for the same reason as above.
+            if issuer.audiences.is_empty() {
+                problems.push(format!(
+                    "issuer `{iss}` names no audiences; every trusted issuer must \
+                     state the audiences its own tokens may carry — \
+                     `Issuer::discover(iss, [AUDIENCE])` — because an issuer \
+                     that names nothing and accepts everything lets a token \
+                     minted for one purpose authenticate as any other. With no \
+                     global audience list to inherit, there is no value here \
+                     that means \"whatever the deployment serves\"",
+                    iss = issuer.iss,
+                ));
+            }
             if issuer.audiences.iter().any(String::is_empty) {
                 problems.push(format!(
                     "issuer `{}` is configured with an empty audience",
                     issuer.iss
                 ));
             }
-            if issuer.audiences.is_empty() && self.issuers.len() > 1 {
+            if issuer.authorized_parties.iter().any(String::is_empty) {
                 problems.push(format!(
-                    "issuer `{iss}` names no audiences while {count} issuers are \
-                     trusted; each issuer must state the audiences its own tokens \
-                     may carry — `Issuer::audience` in code, \
-                     `--issuer-audience {iss}=<AUDIENCE>` on the command line — \
-                     because one audience list shared by {count} issuers lets a \
-                     token minted for one of them authenticate as all of them",
-                    iss = issuer.iss,
-                    count = self.issuers.len(),
+                    "issuer `{}` is configured with an empty authorised party \
+                     (`azp`); an entry nothing can name is a gate that never \
+                     opens, not a gate that is off — omit `Issuer::authorized_party` \
+                     for this issuer to leave it off",
+                    issuer.iss
                 ));
-            }
-            for aud in &issuer.audiences {
-                if !self.audiences.contains(aud) {
-                    problems.push(format!(
-                        "issuer `{}` names audience `{aud}`, which the global \
-                         audience list does not contain; the global list is the \
-                         ceiling and a per-issuer audience can only narrow within \
-                         it",
-                        issuer.iss
-                    ));
-                }
             }
         }
 
@@ -742,8 +789,8 @@ mod tests {
     fn an_empty_issuer_is_refused_at_the_choice_point() {
         let url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
 
-        let err =
-            Issuer::new(String::new(), url, None).expect_err("an empty `iss` is not an issuer");
+        let err = Issuer::new(String::new(), url, None, ["api"])
+            .expect_err("an empty `iss` is not an issuer");
 
         assert!(
             matches!(err, AuthError::Configuration(_)),
@@ -753,6 +800,49 @@ mod tests {
             err.to_string().contains("issuer is empty"),
             "say it is blank; 'would not parse as a URL' describes the symptom and \
              sends them looking for a typo: {err}"
+        );
+    }
+
+    /// The empty audience set is refused where it is created, not at boot.
+    ///
+    /// Arity cannot see inside an iterator, so `[]` compiles and reaches `new`.
+    /// Refusing it there means an `Issuer` that exists always names at least one
+    /// audience, and a caller learns about the mistake on the line that made it
+    /// rather than from a boot failure in another file, which is where the
+    /// constructor arguments are no longer in view.
+    ///
+    /// `validate` keeps its own check for the literals this module can still
+    /// build, and both halves are pinned here. The backstop is not decoration:
+    /// it is the branch that reads "this issuer named nothing" as a refusal
+    /// instead of "anything".
+    #[test]
+    fn an_issuer_with_no_audiences_is_refused_at_the_choice_point() {
+        let err = Issuer::discover("https://identity.example", Vec::<String>::new())
+            .expect_err("naming no audience is not an issuer");
+
+        assert!(
+            matches!(err, AuthError::Configuration(_)),
+            "the operator wrote this, so it is theirs to fix: {err:?}"
+        );
+        let reason = err.to_string();
+        assert!(
+            reason.contains("names no audiences") && reason.contains("identity.example"),
+            "the message must name the issuer that said nothing: {reason}"
+        );
+
+        let literal = Issuer {
+            iss: "https://identity.example".to_owned(),
+            jwks_url: None,
+            audiences: Vec::new(),
+            authorized_parties: Vec::new(),
+        };
+        let refused = AuthConfig::empty().with_issuer(literal).validate();
+        assert!(
+            matches!(
+                refused,
+                Err(AuthError::Configuration(ref reason)) if reason.contains("names no audiences")
+            ),
+            "an empty set that reached a literal must still not boot: {refused:?}"
         );
     }
 
@@ -769,15 +859,23 @@ mod tests {
     /// scheme is permissive, a URL pointing somewhere the issuer does not live. A discovery document fetched from the wrong place is then a *trust*
     /// problem, not a configuration one.
     ///
-    /// The test builds the `Issuer` below as a literal on purpose. Its fields
-    /// are `pub` so a host can assemble one from its own config type. That is
-    /// the route that bypasses both constructors and their parse.
+    /// The literal below is built *inside* this module, which is now the only
+    /// place an `Issuer` can be assembled field-by-field. `audiences` and
+    /// `authorized_parties` are private, so a host cannot write a literal at
+    /// all — one private field is enough to close struct-literal construction —
+    /// and cannot reach an `iss` that skipped `Url::parse`. That closes the
+    /// route this test used to exercise from outside.
+    ///
+    /// It still pins `discovery_url`'s own guard, which matters for the same
+    /// reason as above: the function is `pub(crate)`, and the next caller of it
+    /// does not have to come through `start`.
     #[test]
     fn a_non_url_issuer_never_yields_a_discovery_location() {
         let issuer = Issuer {
             iss: "keycloak.example/realms/demo".to_owned(), // the scheme went missing
             jwks_url: None,
-            audiences: Vec::new(),
+            audiences: vec!["api".to_owned()],
+            authorized_parties: Vec::new(),
         };
 
         let err = issuer

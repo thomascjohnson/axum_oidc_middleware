@@ -52,10 +52,11 @@ pub struct Claims {
     /// configuration. That makes it the reliable client identifier there. It is
     /// unlike `aud`, which a stock realm fills with `"account"` for every API.
     ///
-    /// When you set [`crate::AuthConfig::authorized_parties`], the crate
-    /// compares the claim with that list, and only *after* `aud` has already
-    /// passed. When you leave it unset, the crate exposes the claim but
-    /// enforces nothing.
+    /// When an issuer sets
+    /// [`Issuer::authorized_parties()`](crate::Issuer::authorized_parties), the
+    /// crate compares this claim with that issuer's list, and only *after* `aud`
+    /// has already passed. When an issuer leaves it unset, the crate exposes the
+    /// claim and enforces nothing.
     #[serde(default)]
     pub azp: Option<String>,
 
