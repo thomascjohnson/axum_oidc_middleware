@@ -210,8 +210,8 @@ impl Issuer {
     /// startup, so a document served by the wrong realm fails fast.
     ///
     /// `audiences` is required, and there is no way to ask for an issuer
-    /// without naming it — see [`Issuer::audiences()`]. Add more later with
-    /// [`Self::audience`], and gate on `azp` with [`Self::authorized_party`].
+    /// without naming it — see [`Issuer::audiences()`]. Gate on `azp` with
+    /// [`Self::authorized_party`].
     pub fn discover(
         iss: impl Into<String>,
         audiences: impl IntoIterator<Item = impl Into<String>>,
@@ -290,16 +290,6 @@ impl Issuer {
             // Empty is settled: it means the `azp` gate is off for this issuer.
             authorized_parties: Vec::new(),
         })
-    }
-
-    /// Add one more `aud` for this issuer's tokens. Repeatable.
-    ///
-    /// This cannot create an issuer and cannot empty one, so it only ever adds
-    /// to a set the constructors already required to be stated and already
-    /// refused to leave blank.
-    pub fn audience(mut self, aud: impl Into<String>) -> Self {
-        self.audiences.push(aud.into());
-        self
     }
 
     /// Add one more accepted `azp` for this issuer's tokens. Repeatable.

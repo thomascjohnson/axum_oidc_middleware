@@ -1042,6 +1042,31 @@ mod tests {
             "the second issuer gates on nothing, so it adds nothing here"
         );
 
+        // The accessor a host reads to see what an issuer gates on, in its three
+        // states. The last two are the pair a caller can confuse: an issuer that
+        // gates on nothing still has an entry, and only an issuer that is not
+        // configured at all is absent. `None` is what `check_authorised_party`
+        // treats as drift, so reading it as "no gate" would read the one value
+        // that means "this config no longer matches its keys".
+        assert_eq!(
+            auth.issuer_authorized_parties("https://issuer.example")
+                .map(<[String]>::to_vec),
+            Some(vec!["client".to_owned()]),
+            "the gating issuer reports the client it named"
+        );
+        assert_eq!(
+            auth.issuer_authorized_parties("https://other.example")
+                .map(<[String]>::to_vec),
+            Some(Vec::new()),
+            "the ungated issuer has an entry, and it is empty"
+        );
+        assert_eq!(
+            auth.issuer_authorized_parties("https://unconfigured.example")
+                .map(<[String]>::to_vec),
+            None,
+            "an issuer that is not configured has no entry at all"
+        );
+
         // The same answer, recomputed from the maps the gates actually read.
         // This is the assertion that would fail if a future edit updated one
         // copy and not the other.
@@ -1060,6 +1085,26 @@ mod tests {
             auth.all_audiences(),
             derived.as_slice(),
             "the reporting union must equal the union of the per-issuer sets"
+        );
+
+        // And the same for the client sets. `azp` had no such check: the union
+        // was asserted on its own above, and nothing compared it with what the
+        // gate actually looks up per issuer.
+        let mut derived_parties: Vec<String> = Vec::new();
+        for iss in ["https://issuer.example", "https://other.example"] {
+            for client in auth
+                .issuer_authorized_parties(iss)
+                .expect("every configured issuer has an entry")
+            {
+                if !derived_parties.contains(client) {
+                    derived_parties.push(client.clone());
+                }
+            }
+        }
+        assert_eq!(
+            auth.all_authorized_parties(),
+            derived_parties.as_slice(),
+            "the reporting union must equal the union of the per-issuer client sets"
         );
     }
 
