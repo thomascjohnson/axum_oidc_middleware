@@ -736,16 +736,6 @@ impl AuthConfig {
                     iss = issuer.iss,
                 ));
             }
-            if issuer
-                .audiences
-                .iter()
-                .any(|audience| audience.as_str().is_empty())
-            {
-                problems.push(format!(
-                    "issuer `{}` is configured with an empty audience",
-                    issuer.iss
-                ));
-            }
         }
 
         if problems.is_empty() {

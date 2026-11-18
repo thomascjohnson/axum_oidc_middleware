@@ -1056,22 +1056,32 @@ mod tests {
     /// per-issuer sets would therefore be believed *because* nothing enforces
     /// it. So it is asserted to be exactly the deduplicated union of the sets
     /// the gates read, in issuer order.
+    ///
+    /// Three issuers, because the deduplication is the interesting half and it
+    /// needs a value that arrives twice and a value that arrives nowhere. One
+    /// client id is therefore named by two realms, which is the normal shape
+    /// across two Keycloak realms or two tenants, and one issuer gates on
+    /// nothing.
     #[test]
     fn the_reporting_unions_match_the_per_issuer_sets() {
         let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
         let other_url = Url::parse("https://other.example/jwks.json").expect("a JWKS URL");
+        let third_url = Url::parse("https://third.example/jwks.json").expect("a JWKS URL");
         let registry = JwksRegistry::new(
             [
                 (issuer("https://issuer.example"), jwks_url.clone()),
                 (issuer("https://other.example"), other_url.clone()),
+                (issuer("https://third.example"), third_url.clone()),
             ],
             &["RS256".to_owned()],
             CachePolicy::default(),
             false,
         )
-        .expect("two issuers, one algorithm");
+        .expect("three issuers, one algorithm");
 
-        // `billing` appears on both issuers on purpose: the union deduplicates.
+        // `billing` appears on two issuers and `client` appears on two issuers,
+        // both on purpose: the union deduplicates, and the audience side alone
+        // would leave the client side's dedup arm unexercised.
         let config = AuthConfig::empty().with_issuers([
             Issuer::with_jwks_url("https://issuer.example", jwks_url, ["api", "billing"])
                 .expect("an issuer")
@@ -1079,6 +1089,10 @@ mod tests {
                 .expect("a named client"),
             Issuer::with_jwks_url("https://other.example", other_url, ["billing", "reports"])
                 .expect("an issuer"),
+            Issuer::with_jwks_url("https://third.example", third_url, ["api"])
+                .expect("an issuer")
+                .authorized_party("client")
+                .expect("the same client id, in another realm"),
         ]);
 
         let auth = Authenticator::from_registry(registry, &config);
@@ -1091,7 +1105,8 @@ mod tests {
         assert_eq!(
             auth.all_authorized_parties().to_vec(),
             vec!["client"],
-            "the second issuer gates on nothing, so it adds nothing here"
+            "one client id named by two realms is listed once, and the issuer that \
+             gates on nothing adds nothing"
         );
 
         // The accessor a host reads to see what an issuer gates on, in its three
@@ -1123,7 +1138,11 @@ mod tests {
         // This is the assertion that would fail if a future edit updated one
         // copy and not the other.
         let mut derived: Vec<Audience> = Vec::new();
-        for iss in ["https://issuer.example", "https://other.example"] {
+        for iss in [
+            "https://issuer.example",
+            "https://other.example",
+            "https://third.example",
+        ] {
             let iss = IssuerUrl::parse(iss).expect("a test issuer is a URL");
             for aud in auth
                 .issuer_audiences(&iss)
@@ -1144,7 +1163,11 @@ mod tests {
         // was asserted on its own above, and nothing compared it with what the
         // gate actually looks up per issuer.
         let mut derived_parties: Vec<AuthorizedParty> = Vec::new();
-        for iss in ["https://issuer.example", "https://other.example"] {
+        for iss in [
+            "https://issuer.example",
+            "https://other.example",
+            "https://third.example",
+        ] {
             for client in auth
                 .issuer_authorized_parties(&issuer(iss))
                 .expect("every configured issuer has an entry")
@@ -1319,6 +1342,100 @@ mod tests {
                  not this helper's"
             );
         }
+    }
+
+    /// `claimed_issuer` parses the token for itself and reports its own reason.
+    ///
+    /// Unreachable through `authenticate`, which runs `decode_header` first and
+    /// refuses these shapes there — the same reason
+    /// [`a_signature_from_an_untrusted_issuer_is_named_as_an_issuer_problem`]
+    /// calls `verify` directly. The contract worth pinning is the one the
+    /// pre-parse depends on: `claimed_issuer` splits and decodes on its own
+    /// authority, so it stays correct if a future caller reaches it before any
+    /// header check, or if `decode_header` loosens. A helper that assumed its
+    /// caller had already validated the shape would panic on `"a.b"` the day
+    /// that stopped being true.
+    ///
+    /// [`a_signature_from_an_untrusted_issuer_is_named_as_an_issuer_problem`]: Self::a_signature_from_an_untrusted_issuer_is_named_as_an_issuer_problem
+    #[test]
+    fn claimed_issuer_refuses_a_token_shape_it_cannot_read() {
+        // Too few segments to be a compact JWS at all.
+        assert_eq!(
+            claimed_issuer("a.b"),
+            Err(AuthError::InvalidToken(
+                "not a compact JWS: expected three dot-separated parts".to_owned()
+            )),
+            "the shape refusal is the one thing a caller can act on"
+        );
+
+        // Three segments, and the payload is not base64url.
+        let err = claimed_issuer("aaa.@@@.bbb").expect_err("`@@@` is not base64url");
+        assert!(
+            matches!(err, AuthError::InvalidToken(_))
+                && err.to_string().contains("invalid base64url segment"),
+            "say which segment could not be read, not that the token is forged: {err:?}"
+        );
+    }
+
+    /// A well-formed `iss` comes back parsed, and a malformed one is refused
+    /// with a message that names the claim.
+    ///
+    /// This is the seam the typed-identifier design turned a `String` into an
+    /// `IssuerUrl` at, and the reason the pre-parse exists at all:
+    /// `Claims::iss` has a strict `Deserialize`, so a malformed `iss` that
+    /// reached `jsonwebtoken::decode` would surface as a serde failure, which
+    /// `verify` renders as the generic `failed validation`. Parsing the same
+    /// string here, first, is what keeps the specific message. Pinned as the
+    /// exact text because the wording is the whole product.
+    #[test]
+    fn claimed_issuer_returns_a_parsed_issuer_and_names_a_malformed_one() {
+        use base64::Engine as _;
+
+        let encode = |claims: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&claims).expect("serialise a payload"))
+        };
+        let token = |claims: serde_json::Value| format!("e30.{}.c2ln", encode(claims));
+
+        assert_eq!(
+            claimed_issuer(&token(
+                serde_json::json!({ "iss": "https://identity.example" })
+            ))
+            .expect("an absolute URL parses"),
+            Some(IssuerUrl::parse("https://identity.example").expect("a URL")),
+            "the claim text is what comes back, not a normalised form"
+        );
+
+        // No `iss` at all is `Ok(None)`: the caller decides that a token naming
+        // nobody cannot be routed, and says so in its own words.
+        assert_eq!(
+            claimed_issuer(&token(serde_json::json!({ "sub": "user-1" }))),
+            Ok(None)
+        );
+
+        // Present, but not an absolute URL.
+        let junk = "keycloak.example/realms/demo";
+        let err = claimed_issuer(&token(serde_json::json!({ "iss": junk })))
+            .expect_err("a scheme-less `iss` selects no trust bundle");
+        assert!(
+            matches!(err, AuthError::InvalidToken(_))
+                && err
+                    .to_string()
+                    .contains("token `iss` claim is not an absolute URL"),
+            "name the claim, not the parser: {err:?}"
+        );
+
+        // The value itself stays out of the message. It is attacker-controlled,
+        // arbitrarily long, and this text reaches both a log line and the
+        // `WWW-Authenticate` header. `aud_hint` documents the same bound.
+        let long = format!("{}{}", "n0t-a-url ", "x".repeat(4_000));
+        let echoed = claimed_issuer(&token(serde_json::json!({ "iss": long })))
+            .expect_err("still not a URL");
+        assert!(
+            !echoed.to_string().contains('x'),
+            "the refusal must not carry the value it refused: {} bytes returned",
+            echoed.to_string().len()
+        );
     }
 
     /// The crate refuses a signature that verifies, from an issuer nobody

@@ -824,6 +824,74 @@ async fn rejects_a_token_that_names_no_issuer_before_choosing_a_trust_bundle() {
 }
 
 #[tokio::test]
+async fn rejects_an_issuer_claim_that_is_not_a_url_by_name() {
+    // Gate 2 reads the unverified `iss` to pick a trust bundle, and the crate
+    // parses that value *before* `jsonwebtoken::decode` runs. Two things depend
+    // on the order.
+    //
+    // The message. `Claims::iss` has a strict `Deserialize`, so a malformed
+    // `iss` that reached `decode` fails inside serde, which `verify` renders as
+    // the generic `failed validation`. An operator then reads "bad token" where
+    // the truth is "your issuer identifier is not a URL", and goes looking for a
+    // broken realm. Parsing the same string first buys the specific wording, and
+    // costs nothing, because a string that parsed here cannot fail the later
+    // strict parse.
+    //
+    // The blame. This is not an unreachable provider and not a forged signature.
+    // It is a payload that identifies no issuer this crate can even name.
+    let key = TestKey::generate("k1");
+    let h = Harness::start(std::slice::from_ref(&key)).await;
+
+    // A realm URL with its scheme left off — the single most likely way an
+    // operator or a client library produces this, and the shape `Url::parse`
+    // refuses as `RelativeUrlWithoutBase`.
+    let mut claims = key.claims(&h.iss, AUDIENCE);
+    claims.as_object_mut().expect("claims object").insert(
+        "iss".to_owned(),
+        serde_json::json!("keycloak.example/realms/demo"),
+    );
+
+    let err = h
+        .auth
+        .authenticate(&key.sign(&claims))
+        .await
+        .expect_err("an `iss` that is not a URL selects no trust bundle");
+
+    assert!(matches!(err, AuthError::InvalidToken(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("token `iss` claim is not an absolute URL"),
+        "say the claim is malformed, not that the token is forged or the provider \
+         is down: {err}"
+    );
+
+    // The refused value stays out of the refusal. `iss` is attacker-controlled
+    // and unbounded, and this text reaches a log line and the `WWW-Authenticate`
+    // header, so the message names the claim and stops.
+    let noisy = format!("{}{}", "not-a-url ", "s".repeat(4_000));
+    claims
+        .as_object_mut()
+        .expect("claims object")
+        .insert("iss".to_owned(), serde_json::json!(noisy));
+
+    let err = h
+        .auth
+        .authenticate(&key.sign(&claims))
+        .await
+        .expect_err("a longer non-URL is still a non-URL");
+    let reason = err.to_string();
+    assert!(
+        !reason.contains(&noisy),
+        "the refusal must not carry the value it refused, which is attacker-sized: \n         {} bytes returned",
+        reason.len()
+    );
+    assert!(
+        reason.len() < 120,
+        "and it has to stay short, because it reaches `WWW-Authenticate`: {reason}"
+    );
+}
+
+#[tokio::test]
 async fn rejects_a_payload_that_is_not_json_as_unreadable() {
     // The middleware must read the payload unverified, to pick a trust
     // bundle. A parser that accepts anything, or no parser at all, hides

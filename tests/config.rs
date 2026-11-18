@@ -480,6 +480,55 @@ fn validate_reports_every_problem_at_once() {
     );
 }
 
+#[tokio::test]
+async fn start_refuses_a_config_that_validate_refuses_before_touching_the_network() {
+    // `start` is the path a real deployment takes, and `validate` is its first
+    // statement. Pinned here rather than only through `validate` itself, because
+    // the two failure modes look nothing alike from the outside: an unusable
+    // configuration must arrive as `Configuration`, in the operator's own terms,
+    // and not as a provider timeout thirty seconds later that blames the issuer
+    // for the deployment's own typo.
+    //
+    // The issuer below is deliberately unreachable — port 1 on loopback, so
+    // nothing can answer it, at most one connection attempt that is refused at
+    // once. If `start` ever skipped `validate`, this test would fail with
+    // `ProviderUnavailable`, which is the bug it is watching for.
+    let unreachable =
+        url::Url::parse("http://127.0.0.1:1/realms/demo/jwks.json").expect("parse a JWKS URL");
+    let config = AuthConfig::empty()
+        .with_issuer(
+            Issuer::with_jwks_url("http://127.0.0.1:1/realms/demo", unreachable, [AUDIENCE])
+                .expect("valid issuer"),
+        )
+        .with_insecure_http(true)
+        .with_algorithms([]);
+
+    let err = Authenticator::start(config)
+        .await
+        .expect_err("a deployment with no algorithms cannot start");
+
+    assert!(
+        matches!(err, AuthError::Configuration(_)),
+        "an unusable config is the operator's, not the provider's: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("no allowed signature algorithms"),
+        "the same words `validate` uses, carried out of `start` unchanged: {err}"
+    );
+
+    // And the shape a caller reaches for by accident: `AuthConfig::empty()` on
+    // its own trusts nobody, which is a 401 on every route rather than a boot
+    // failure, unless `start` refuses it.
+    let err = Authenticator::start(AuthConfig::empty())
+        .await
+        .expect_err("an empty config authenticates nothing");
+    assert!(
+        matches!(err, AuthError::Configuration(_))
+            && err.to_string().contains("no trusted issuers"),
+        "{err:?}"
+    );
+}
+
 // ── The defaults ─────────────────────────────────────────────────────────────
 
 /// `Default` and `empty()` are the same config, so a caller that reaches for

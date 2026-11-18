@@ -75,6 +75,38 @@ fn an_empty_audience_list_is_rejected() {
     );
 }
 
+/// `aud` that is neither a string nor a list of strings is refused outright.
+///
+/// The deserialiser has exactly two readings, and a value that fits neither must
+/// not arrive as a `Claims` with an empty or half-built `aud`. An empty list is
+/// the state the gate above refuses by hand, and a list whose elements were
+/// quietly dropped is worse: the token would carry one audience fewer than the
+/// issuer said, and a gate that reads a shorter list accepts a narrower set of
+/// tokens than it means to. So neither shape is coerced into the other.
+///
+/// The wording is serde's own — it names the *shape* that failed rather than the
+/// claim, because an untagged enum cannot see which field it was asked for. That
+/// is acceptable here and not elsewhere: this refusal happens inside `decode`, on
+/// a payload that has already been routed by a parsed `iss`, so the operator has
+/// the issuer in hand and needs only to be told the token was unreadable.
+#[test]
+fn an_aud_that_is_neither_a_string_nor_a_list_is_rejected() {
+    for shape in [
+        json!(5),
+        json!(true),
+        json!(null),
+        json!({ "0": "myaudience" }),
+        json!(["myaudience", 5]),
+    ] {
+        let err = serde_json::from_value::<Claims>(claims(json!({ "aud": shape })))
+            .expect_err("`{shape}` is not an `aud`");
+        assert!(
+            !err.to_string().is_empty(),
+            "a refusal that says nothing is worse than no refusal"
+        );
+    }
+}
+
 /// Both wire forms still work: Google's single string and RFC 9068's list. A
 /// single-string `aud` is the shape that would silently regress if the
 /// untagged enum were reordered or narrowed.

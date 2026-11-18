@@ -729,4 +729,264 @@ mod tests {
         // expected, so the only thing left to assert is that the text is kept.
         assert_eq!(aud.as_str(), party.as_str());
     }
+
+    /// `{:?}` prints the claim text, and prints it once.
+    ///
+    /// `IssuerUrl` holds two spellings of the same issuer, and a derived `Debug`
+    /// would print both. A reader looking at
+    /// `IssuerUrl { raw: "https://accounts.google.com", url: "https://accounts.google.com/" }`
+    /// in a panic message or a `tracing` field concludes the two fields disagree
+    /// about the issuer and starts debugging the wrong thing. They do not: the
+    /// slash is what a URL parser adds, and it is not part of the identifier.
+    ///
+    /// This is the same hazard `Audience` and `AuthorizedParty` dodged in the
+    /// other direction — their `Debug` keeps a `String`'s quoting so the TRACE
+    /// line in `extract` does not change shape. Here the risk is not the format
+    /// of the line but the number of answers on it.
+    #[test]
+    fn the_debug_form_prints_the_claim_text_once() {
+        let iss = IssuerUrl::parse("https://accounts.google.com").expect("a URL");
+
+        assert_eq!(
+            format!("{iss:?}"),
+            "https://accounts.google.com",
+            "one value, the one a token carries"
+        );
+        assert!(
+            !format!("{iss:?}").ends_with('/'),
+            "the parsed form of this issuer ends in a slash and the claim text does \n             not, so a printed slash means the derived form leaked: {iss:?}"
+        );
+
+        // And inside a container, which is how a test failure or a log line
+        // actually prints it.
+        assert_eq!(
+            format!("{:?}", vec![iss]),
+            r"[https://accounts.google.com]",
+            "a list of issuers reads as a list of issuers"
+        );
+    }
+
+    /// A map keyed by `IssuerUrl` answers the bare text a token carries.
+    ///
+    /// `Borrow<str>` is what lets `HashMap<IssuerUrl, _>::get` take the `&str`
+    /// from an unverified payload instead of building an `IssuerUrl` first. It is
+    /// only sound because `Hash` and `Eq` above are both over `raw`, and a `str`
+    /// hashes and compares as the same bytes — a note on the impl itself, and one
+    /// that is worth a test rather than a comment, since the failure mode of
+    /// drift here is a *silent miss*: the lookup returns `None` for an issuer
+    /// that is configured, and the caller reads that as "not trusted".
+    ///
+    /// The two refusals are the half that matters. Both strings parse to the same
+    /// `Url` the key holds, so a map that keyed on the parsed form would hit.
+    /// They are different issuers, and must miss.
+    #[test]
+    fn an_issuer_keyed_map_answers_the_text_a_token_carried() {
+        use std::collections::HashMap;
+
+        let mut gates: HashMap<IssuerUrl, Vec<Audience>> = HashMap::new();
+        gates.insert(
+            IssuerUrl::parse("https://EXAMPLE.example/realms/demo").expect("a URL"),
+            vec![Audience::new("api").expect("an audience")],
+        );
+
+        assert!(
+            gates.contains_key("https://EXAMPLE.example/realms/demo"),
+            "the claim text alone selects the entry"
+        );
+        assert!(
+            !gates.contains_key("https://example.example/realms/demo"),
+            "the same issuer lowercased is a different `iss`, and must not be \
+             served this entry"
+        );
+        assert!(
+            !gates.contains_key("https://EXAMPLE.example/realms/demo/"),
+            "a trailing slash is a different `iss` too"
+        );
+    }
+
+    /// The wire form is the claim text, not the normalised URL.
+    ///
+    /// `IssuerUrl` has two fields and only one of them is on the wire, so
+    /// `Serialize` is hand-written. A derived impl, or one that reached for
+    /// `url()`, would make a `Claims` value re-serialise with a trailing slash
+    /// the issuer never sent. A host that logs or forwards that JSON would then
+    /// publish an `iss` that no token it ever verified carries.
+    #[test]
+    fn an_issuer_serialises_as_the_claim_text_not_the_normalised_url() {
+        let iss = IssuerUrl::parse("https://accounts.google.com").expect("a URL");
+        assert_eq!(
+            iss.url().as_str(),
+            "https://accounts.google.com/",
+            "the two forms do differ here, which is what makes this worth asserting"
+        );
+
+        let json = serde_json::to_string(&iss).expect("an issuer serialises");
+        assert_eq!(json, "\"https://accounts.google.com\"");
+
+        let read = serde_json::from_str::<IssuerUrl>(&json).expect("and reads back");
+        assert_eq!(read, iss, "a round trip keeps the identity");
+        assert_eq!(read.as_str(), iss.as_str());
+    }
+
+    /// An `iss` that is not a string cannot reach a `Claims` value.
+    ///
+    /// `Deserialize` is strict for this type — unlike `Audience`, whose wire
+    /// constructor is deliberately lenient — so it has a failure path of its own
+    /// besides the parse: the value may not be a string at all. Neither path is
+    /// reachable from `authenticate`, which pre-parses `iss` in `claimed_issuer`
+    /// and refuses it there with a message that names the claim. What is pinned
+    /// here is the invariant for a `Claims` value built from arbitrary JSON, the
+    /// way a host that fetches a JWKS-shaped document or replays a recorded
+    /// payload would build one.
+    #[test]
+    fn an_issuer_that_is_not_a_string_or_not_a_url_is_refused_on_the_wire() {
+        for not_an_issuer in [serde_json::json!(5), serde_json::json!(true)] {
+            let err = serde_json::from_value::<IssuerUrl>(not_an_issuer.clone())
+                .expect_err("only a string can be an `iss`");
+            assert!(
+                err.to_string().contains("invalid type"),
+                "{not_an_issuer}: {err}"
+            );
+        }
+
+        // A string that is not an absolute URL is refused by the same call that
+        // makes the type, so a `Claims` value cannot hold one either.
+        let err =
+            serde_json::from_value::<IssuerUrl>(serde_json::json!("keycloak.example/realms/demo"))
+                .expect_err("a scheme-less `iss` is not an issuer");
+        assert!(
+            err.to_string().contains("is not a URL"),
+            "the parse's own words survive the serde wrapper: {err}"
+        );
+    }
+
+    /// Both identifiers borrow as the text they wrap.
+    ///
+    /// `AsRef<str>` is what lets a host hand an audience to a generic it did not
+    /// write — a `BTreeMap` key, a hasher, a `display` log field — without
+    /// unwrapping the newtype at every call site. `as_str` is the accessor a
+    /// reader sees in the docs; this pins that the two never disagree, which is
+    /// the only way the generic form can be trusted.
+    #[test]
+    fn both_identifiers_borrow_as_the_text_they_wrap() {
+        let aud = Audience::new("my-api").expect("an audience");
+        let party = AuthorizedParty::new("my-client").expect("a client");
+
+        let aud_text: &str = aud.as_ref();
+        let party_text: &str = party.as_ref();
+        assert_eq!(aud_text, "my-api");
+        assert_eq!(party_text, "my-client");
+        assert_eq!(aud_text, aud.as_str(), "`as_ref` is `as_str`");
+        assert_eq!(party_text, party.as_str());
+
+        // Reachable through a generic, which is the reason the impl exists.
+        fn shout(value: impl AsRef<str>) -> String {
+            value.as_ref().to_uppercase()
+        }
+        assert_eq!(shout(&aud), "MY-API");
+        assert_eq!(shout(&party), "MY-CLIENT");
+    }
+
+    /// A `HashSet` of either identifier keeps one entry per text.
+    ///
+    /// Hashing is over the wrapped string, so the newtype does not change what
+    /// de-duplication means — the property the macro's own documentation claims.
+    /// It is what lets a host collapse the audiences it read from a config file
+    /// without mapping them back to `String` first, and what makes a
+    /// `HashSet<AuthorizedParty>` of two realms' client ids refuse to merge
+    /// values that only look alike.
+    #[test]
+    fn a_hash_set_of_either_identifier_keeps_one_entry_per_text() {
+        use std::collections::HashSet;
+
+        let audiences: HashSet<Audience> = ["api", "other", "api"]
+            .into_iter()
+            .map(|value| Audience::new(value).expect("an audience"))
+            .collect();
+        assert_eq!(
+            audiences.len(),
+            2,
+            "the repeat collapses, so hashing is over the text"
+        );
+        assert!(
+            audiences.contains(&Audience::new("api").expect("an audience")),
+            "and a value built later still finds the entry"
+        );
+        assert!(!audiences.contains(&Audience::new("API").expect("an audience")));
+
+        let parties: HashSet<AuthorizedParty> = ["client", "client", "other"]
+            .into_iter()
+            .map(|value| AuthorizedParty::new(value).expect("a client"))
+            .collect();
+        assert_eq!(parties.len(), 2, "the same rule for `azp`");
+    }
+
+    /// Comparison against a bare `str`, the third of the three spellings.
+    ///
+    /// `PartialEq<&str>` covers `aud == "my-api"` and `PartialEq<String>` covers
+    /// `Vec<Audience> == Vec<String>`. This arm is the one a host reaches when
+    /// the other side is the `str` behind a slice or a split — the `*` below is
+    /// the spelling that selects it, and without the impl that line stops
+    /// compiling. It is convenience, not proof: no gate in the crate decides
+    /// anything from it.
+    #[test]
+    fn both_identifiers_compare_against_a_bare_str() {
+        let aud = Audience::new("my-api").expect("an audience");
+        let party = AuthorizedParty::new("my-client").expect("a client");
+
+        let from_a_split = "my-api,other".split(',').next().expect("a first item");
+        assert_eq!(aud, *from_a_split, "`Audience` against a `str`");
+        assert_ne!(aud, *"nope");
+
+        let client: &str = "my-client";
+        assert_eq!(party, *client, "`AuthorizedParty` against a `str`");
+        assert_ne!(party, *"my-api");
+    }
+
+    /// A value read from a config file builds either identifier.
+    ///
+    /// Config arrives as owned `String`s, and iterating a `Vec<String>` yields
+    /// `&String`, not `&str`. Without `TryFrom<&String>` a host has to `.cloned()`
+    /// or `.iter().map(String::as_str)` its own settings into the shape this
+    /// crate asks for, which is exactly the friction that pushes callers to
+    /// `unwrap` a conversion they should have to handle.
+    ///
+    /// The blank refusal is asserted too: the borrowed form refuses for the same
+    /// reason and with the same words as the owned one, because it delegates
+    /// rather than repeating the check.
+    #[test]
+    fn a_config_value_held_as_an_owned_string_builds_either_identifier() {
+        let owned_audiences = vec!["my-api".to_owned(), "other-api".to_owned()];
+        let issuer = crate::Issuer::discover("https://identity.example", owned_audiences.iter())
+            .expect("audiences read from a file are still audiences");
+        assert_eq!(issuer.audiences(), owned_audiences.as_slice());
+
+        let owned_client = "my-client".to_owned();
+        let issuer = issuer
+            .authorized_party(&owned_client)
+            .expect("a client read from a file is still a client");
+        assert_eq!(issuer.authorized_parties(), [owned_client].as_slice());
+
+        // Conversions called directly, including the case each one refuses.
+        assert_eq!(
+            Audience::try_from(&String::from("my-api")).expect("an audience"),
+            Audience::new("my-api").expect("an audience")
+        );
+        assert_eq!(
+            AuthorizedParty::try_from(&String::from("my-client")).expect("a client"),
+            AuthorizedParty::new("my-client").expect("a client")
+        );
+        assert!(
+            Audience::try_from(&String::new())
+                .expect_err("a borrowed blank audience is still blank")
+                .to_string()
+                .contains("audience is empty")
+        );
+        assert!(
+            AuthorizedParty::try_from(&String::new())
+                .expect_err("a borrowed blank client is still blank")
+                .to_string()
+                .contains("azp")
+        );
+    }
 }

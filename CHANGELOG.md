@@ -5,6 +5,32 @@ All notable changes to this crate are recorded here. The format follows
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Being
 pre-1.0, a breaking change moves the minor number: `0.1.x` to `0.2.0`.
 
+## Unreleased
+
+### Fixed — one guard `0.3.0` said it had removed was still in the file
+
+`AuthConfig::validate` still carried a check for an issuer configured with a
+blank audience, one statement below the comment that says that check is gone.
+It could not fire: `Audience::new` refuses a blank entry, it is the only
+constructor a caller can reach, and `Issuer::audiences` is private. The entry
+above said the same thing. The check is removed, so the code, the comment, and
+that 0.3.0 entry now agree. No configuration that was accepted is refused, and
+none that was refused is accepted.
+
+### Tests — back to every function executed
+
+The typed identifiers added functions the suite never called: `IssuerUrl`'s
+`Debug`, `Serialize`, and `Borrow<str>`, and the `AsRef<str>`, `Hash`,
+`PartialEq<str>`, and `TryFrom<&String>` impls of `Audience` and
+`AuthorizedParty`. Each now has a test that states the property it exists for —
+that a map keyed by `IssuerUrl` answers the claim text a token carried, that a
+`Claims` value re-serialises to that text and not to the normalised URL, that a
+`&String` read out of a config file builds an audience. `claimed_issuer`'s
+refusal of an `iss` that is not an absolute URL had no test at all, and it is
+the one behaviour change of 0.3.0 a reviewer had to take on trust; it is asserted
+through `authenticate`, including that the refused value stays out of the
+refusal. 220 tests, 100% of functions executed.
+
 ## 0.3.0 - 2026-11-18
 
 ### Changed — identifiers are typed, and the parse happens once
