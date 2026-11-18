@@ -357,18 +357,24 @@ impl Issuer {
 ///
 /// What enforces the rule is the shape of [`Issuer`], not a field here. An
 /// `Issuer` cannot be built without naming its audiences, and cannot be built
-/// as a literal at all:
+/// as a literal at all. `audiences` and `authorized_parties` are private, and
+/// `iss` accepts only an [`IssuerUrl`], which is not something a literal can
+/// conjure:
 ///
 /// ```compile_fail
 /// use axum_oidc_middleware::Issuer;
 ///
 /// let issuer = Issuer {
-///     iss: "https://identity.example".to_owned(),
+///     iss: "https://identity.example".to_owned(), // the field takes an `IssuerUrl`
 ///     jwks_url: None,
 ///     audiences: vec![],
 ///     authorized_parties: vec![],
 /// };
 /// ```
+///
+/// Both barriers point the same way. A caller writes [`Issuer::discover`] or
+/// [`Issuer::with_jwks_url`], and those parse the issuer and take the audience
+/// set as a required argument.
 ///
 /// Functional record update on `AuthConfig` still compiles, and that is fine:
 /// every field it can carry is safe to write, and an `Issuer` in that vector

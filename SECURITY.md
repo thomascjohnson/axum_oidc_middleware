@@ -65,8 +65,8 @@ further than the verification order allows:
 
 | Version    | Supported |
 | ---------- | --------- |
-| 0.1.x      | yes       |
-| < 0.1      | no        |
+| 0.3.x      | yes       |
+| < 0.3      | no        |
 
 Before 1.0, we fix only the latest release. When a fix ships, we yank the
 older releases from crates.io instead of backporting to them. A verification path

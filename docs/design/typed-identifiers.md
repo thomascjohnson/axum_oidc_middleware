@@ -1,7 +1,10 @@
 # Design: typed identifiers (`IssuerUrl`, `Audience`, `AuthorizedParty`)
 
-Status: proposal for review. Target release: `0.3.0` (pre-1.0, so a breaking
-change moves the minor number — see `CHANGELOG.md`).
+Status: implemented in `0.3.0` across four commits. Where the implementation
+differed from this proposal, the difference is recorded in §11.
+
+Target release: `0.3.0` (pre-1.0, so a breaking change moves the minor number —
+see `CHANGELOG.md`).
 
 ## 1. The problem
 
@@ -363,3 +366,41 @@ fn a_host_with_no_path_keeps_the_claim_text_it_was_given() {
   are non-blank and separated by role, not that a comparison is correct.
 - **`IssuerUrl` holds two copies of the issuer.** Roughly 40 bytes extra per
   issuer, at boot only.
+
+## 11. What the implementation changed from this plan
+
+Four things were found while building it, and each is recorded here because a
+proposal that quietly diverged from the code is worse than no proposal.
+
+1. **`Audience::from_wire` was added; `AuthorizedParty` did not need one.**
+   §4.2 said the wire shape is taken as it arrives. `Claims::aud` is built by a
+   custom deserialiser that reads raw `String`s, so it needed a crate-internal
+   constructor without the blank check. `Claims::azp` is an
+   `Option<AuthorizedParty>`, which goes through the macro's already-lenient
+   `Deserialize`, so a second constructor would have been dead code.
+2. **`Debug` does not delegate to `Display` for `Audience` and
+   `AuthorizedParty`.** The first attempt did, and
+   `tests/observability.rs` caught it: the TRACE line carrying `aud` changed
+   from `["my-audience"]` to `[my-audience]`. `lib.rs` documents that log line,
+   so `Debug` now quotes exactly as `String` did. `IssuerUrl`'s `Debug` **does**
+   delegate to `Display`, because showing both of its internal forms invites a
+   reader to compare them and conclude they disagree about the issuer.
+3. **A `string_identifier!` macro holds the mechanical impls.** §4.2 proposed
+   writing the two types out explicitly. The struct, its documentation, and its
+   validating constructor are still hand-written per type — that is where the
+   reasoning lives — but `Display`, equality, hashing, the serde impls and the
+   `TryFrom` conversions are generated, so two copies cannot drift.
+4. **`PartialEq<String>` was added to the macro.** §4.2 listed `PartialEq<str>`
+   and `PartialEq<&str>` only. `Vec`'s `PartialEq` delegates to its elements, so
+   without this an assertion like `claims.aud == vec!["my-api".to_owned()]`
+   stops compiling. It is the same convenience the other two impls are, and
+   nothing gates on it.
+
+Two smaller notes:
+
+- `Issuer::authorized_party` returning `Result` is the single place a **valid**
+  caller must add a character, as §5 predicted. `lib.rs`, `README.md`, and
+  `examples/quickstart.rs` all needed the `?`.
+- `SECURITY.md` still listed `0.1.x` as the supported line, which was already
+  stale at `0.2.0`. It now names `0.3.x`, so the security policy and the release
+  do not contradict each other.
