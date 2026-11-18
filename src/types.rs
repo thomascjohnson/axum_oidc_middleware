@@ -429,6 +429,62 @@ impl Audience {
 
 string_identifier!(Audience);
 
+/// One `azp` value a token from a given issuer may name: the client that asked
+/// for it.
+///
+/// # Why it is distinct from [`Audience`]
+///
+/// The two are different claims with different scopes, and the crate gates on
+/// both. `aud` names a resource this API is; `azp` names the client the token
+/// was minted for. `src/validator.rs` compares each against its own configured
+/// list, and both lists used to be `Vec<String>`. A distinct type per role means
+/// an `azp` list cannot be checked against an `aud` set by accident.
+///
+/// # Why the type does not carry the per-issuer rule
+///
+/// A client id is unique within a realm, not across realms, so an accepted `azp`
+/// is deliberate about its issuer. That scoping is a property of
+/// [`Issuer::authorized_parties`](crate::Issuer::authorized_parties), which owns
+/// the list and the reasoning. This type only says what one entry is.
+///
+/// # The asymmetry, matched to [`Audience`]
+///
+/// [`AuthorizedParty::new`] refuses a blank entry, because an entry nothing can
+/// name is a gate that never opens rather than a gate that is off — and the
+/// operator wrote it. The serde `Deserialize` accepts what the token carried,
+/// because `Claims::azp` is untrusted input and the gate reports it.
+#[derive(Clone)]
+pub struct AuthorizedParty(String);
+
+impl AuthorizedParty {
+    /// Take one client id a token from this issuer may name.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Configuration`] when `value` is empty. Leave
+    /// [`Issuer::authorized_party`](crate::Issuer::authorized_party) uncalled to
+    /// turn the gate off for an issuer; do not name a blank client to do it.
+    pub fn new(value: impl Into<String>) -> Result<Self, AuthError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(AuthError::Configuration(
+                "authorised party (`azp`) is empty; an entry nothing can name is a gate \
+                 that never opens, not a gate that is off — omit \
+                 `Issuer::authorized_party` for this issuer to leave it off"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// The claim text, exactly as configured.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+string_identifier!(AuthorizedParty);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +669,64 @@ mod tests {
         // The `Vec` form delegates to the elements, which is how a test compares
         // a parsed claim against the literals it was built from.
         assert_eq!(vec![aud], vec!["my-api".to_owned()]);
+    }
+
+    /// A blank `azp` is refused where the operator writes it.
+    ///
+    /// The point is the one `Audience` makes, for the claim that is easiest to
+    /// get wrong. Leaving `azp` unset is how you turn that issuer's gate off;
+    /// naming a blank client is not, and it used to be caught only at boot.
+    #[test]
+    fn a_blank_authorized_party_is_refused_at_construction() {
+        let err = AuthorizedParty::new("").expect_err("a blank client names nothing");
+
+        assert!(
+            matches!(err, AuthError::Configuration(_)),
+            "the operator wrote this, so it is theirs to fix: {err:?}"
+        );
+        let reason = err.to_string();
+        assert!(
+            reason.contains("azp"),
+            "name the claim, so the operator knows which setting to edit: {reason}"
+        );
+        assert!(
+            reason.contains("Issuer::authorized_party"),
+            "and name the way to leave the gate off instead: {reason}"
+        );
+    }
+
+    /// An `azp` serialises as a bare string, so a `Claims` value keeps its
+    /// shape across the newtype.
+    #[test]
+    fn an_authorized_party_serialises_as_a_bare_string() {
+        let party = AuthorizedParty::new("my-client").expect("a client");
+        assert_eq!(
+            serde_json::to_string(&party).expect("a client serialises"),
+            "\"my-client\""
+        );
+
+        let some = Some(AuthorizedParty::new("my-client").expect("a client"));
+        let json = serde_json::to_string(&some).expect("an option serialises");
+        assert_eq!(json, "\"my-client\"");
+        assert_eq!(
+            serde_json::from_str::<Option<AuthorizedParty>>(&json).expect("reads back"),
+            some
+        );
+
+        let none = serde_json::from_str::<Option<AuthorizedParty>>("null").expect("null is absent");
+        assert_eq!(none, None, "an explicit null is still no claim");
+    }
+
+    /// The two identifier types do not interchange, which is the reason each
+    /// exists. This is a compile-time property, so what is checked here is the
+    /// runtime half: they compare by their own text and never to each other.
+    #[test]
+    fn an_audience_and_a_client_are_different_types() {
+        let aud = Audience::new("myapp").expect("an audience");
+        let party = AuthorizedParty::new("myapp").expect("a client");
+
+        // Same text, different roles. Neither can be passed where the other is
+        // expected, so the only thing left to assert is that the text is kept.
+        assert_eq!(aud.as_str(), party.as_str());
     }
 }

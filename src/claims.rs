@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::types::{Audience, IssuerUrl};
+use crate::types::{Audience, AuthorizedParty, IssuerUrl};
 
 /// Claims from a token that passed signature verification **and** the
 /// issuer/audience/expiry gates in [`Authenticator::authenticate`](crate::Authenticator::authenticate).
@@ -73,7 +73,7 @@ pub struct Claims {
     /// has already passed. When an issuer leaves it unset, the crate exposes the
     /// claim and enforces nothing.
     #[serde(default)]
-    pub azp: Option<String>,
+    pub azp: Option<AuthorizedParty>,
 
     /// `email` — convenience for the common "who is the human" question.
     ///

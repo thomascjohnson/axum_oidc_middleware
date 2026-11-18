@@ -39,7 +39,7 @@ use crate::claims::Claims;
 use crate::config::{AuthConfig, Issuer, SignatureAlgorithm};
 use crate::error::AuthError;
 use crate::jwks::{CachePolicy, JwksRegistry};
-use crate::types::{Audience, IssuerUrl};
+use crate::types::{Audience, AuthorizedParty, IssuerUrl};
 
 /// Verifies bearer tokens from one or more OIDC issuers.
 ///
@@ -92,7 +92,7 @@ struct Inner {
     issuer_audiences: HashMap<IssuerUrl, Vec<Audience>>,
     /// Every `azp` named by any issuer, derived once, for the accessor.
     /// Reporting only — nothing here accepts a token, and the name says so.
-    authorized_parties_for_reporting: Vec<String>,
+    authorized_parties_for_reporting: Vec<AuthorizedParty>,
     /// Per-issuer `azp` sets, keyed by the exact `iss`. An entry is the set of
     /// clients accepted *from that issuer*, and the `azp` gate is off for an
     /// issuer whose entry is empty.
@@ -101,7 +101,7 @@ struct Inner {
     /// unique within a realm, not across realms. The reasoning, and the swap a
     /// shared list would allow, are on
     /// [`Issuer::authorized_parties()`](crate::Issuer::authorized_parties).
-    issuer_authorized_parties: HashMap<IssuerUrl, Vec<String>>,
+    issuer_authorized_parties: HashMap<IssuerUrl, Vec<AuthorizedParty>>,
 }
 
 impl Authenticator {
@@ -168,7 +168,7 @@ impl Authenticator {
             .iter()
             .map(|issuer| (issuer.iss().clone(), issuer.audiences().to_vec()))
             .collect();
-        let issuer_authorized_parties: HashMap<IssuerUrl, Vec<String>> = config
+        let issuer_authorized_parties: HashMap<IssuerUrl, Vec<AuthorizedParty>> = config
             .issuers
             .iter()
             .map(|issuer| (issuer.iss().clone(), issuer.authorized_parties().to_vec()))
@@ -226,14 +226,14 @@ impl Authenticator {
     /// from the issuer that named it, which is what
     /// [`Self::issuer_authorized_parties`] holds. This is the union of those
     /// per-issuer sets, not a set any gate consults.
-    pub fn all_authorized_parties(&self) -> &[String] {
+    pub fn all_authorized_parties(&self) -> &[AuthorizedParty] {
         &self.inner.authorized_parties_for_reporting
     }
 
     /// The `azp` values a token from `iss` may name, or `None` when no such
     /// issuer is configured. An empty slice means that issuer's `azp` gate is
     /// off, and it is off for that issuer alone.
-    pub fn issuer_authorized_parties(&self, iss: &str) -> Option<&[String]> {
+    pub fn issuer_authorized_parties(&self, iss: &IssuerUrl) -> Option<&[AuthorizedParty]> {
         self.inner
             .issuer_authorized_parties
             .get(iss)
@@ -311,8 +311,8 @@ impl Authenticator {
             return Ok(());
         }
 
-        match claims.azp.as_deref() {
-            Some(azp) if accepted.iter().any(|party| party == azp) => Ok(()),
+        match claims.azp.as_ref() {
+            Some(azp) if accepted.contains(azp) => Ok(()),
             // Distinguished in the message only. Both are the same refusal,
             // and `azp`-absent versus `azp`-unexpected is enough to tell a
             // misconfigured client scope apart from the wrong client. The
@@ -875,6 +875,15 @@ mod tests {
         IssuerUrl::parse(url).expect("a test issuer is a URL")
     }
 
+    /// The configured clients as text, so an assertion compares strings and not
+    /// newtypes it had to build.
+    fn party_text(parties: &[AuthorizedParty]) -> Vec<String> {
+        parties
+            .iter()
+            .map(|party| party.as_str().to_owned())
+            .collect()
+    }
+
     /// The `SHOWN` boundary, where the count and the list stop agreeing.
     ///
     /// At exactly `SHOWN` audiences the hidden count is zero. A zero-count
@@ -1066,7 +1075,8 @@ mod tests {
         let config = AuthConfig::empty().with_issuers([
             Issuer::with_jwks_url("https://issuer.example", jwks_url, ["api", "billing"])
                 .expect("an issuer")
-                .authorized_party("client"),
+                .authorized_party("client")
+                .expect("a named client"),
             Issuer::with_jwks_url("https://other.example", other_url, ["billing", "reports"])
                 .expect("an issuer"),
         ]);
@@ -1091,20 +1101,20 @@ mod tests {
         // treats as drift, so reading it as "no gate" would read the one value
         // that means "this config no longer matches its keys".
         assert_eq!(
-            auth.issuer_authorized_parties("https://issuer.example")
-                .map(<[String]>::to_vec),
+            auth.issuer_authorized_parties(&issuer("https://issuer.example"))
+                .map(party_text),
             Some(vec!["client".to_owned()]),
             "the gating issuer reports the client it named"
         );
         assert_eq!(
-            auth.issuer_authorized_parties("https://other.example")
-                .map(<[String]>::to_vec),
+            auth.issuer_authorized_parties(&issuer("https://other.example"))
+                .map(party_text),
             Some(Vec::new()),
             "the ungated issuer has an entry, and it is empty"
         );
         assert_eq!(
-            auth.issuer_authorized_parties("https://unconfigured.example")
-                .map(<[String]>::to_vec),
+            auth.issuer_authorized_parties(&issuer("https://unconfigured.example"))
+                .map(party_text),
             None,
             "an issuer that is not configured has no entry at all"
         );
@@ -1133,10 +1143,10 @@ mod tests {
         // And the same for the client sets. `azp` had no such check: the union
         // was asserted on its own above, and nothing compared it with what the
         // gate actually looks up per issuer.
-        let mut derived_parties: Vec<String> = Vec::new();
+        let mut derived_parties: Vec<AuthorizedParty> = Vec::new();
         for iss in ["https://issuer.example", "https://other.example"] {
             for client in auth
-                .issuer_authorized_parties(iss)
+                .issuer_authorized_parties(&issuer(iss))
                 .expect("every configured issuer has an entry")
             {
                 if !derived_parties.contains(client) {

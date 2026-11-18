@@ -75,9 +75,12 @@ async fn main() {
         // Google does not — must be left ungated or every one of its tokens
         // fails a claim it cannot make. Trust such an issuer alongside a
         // Keycloak realm and only the realm gets the `authorized_party` call.
-        let issuer = parties.iter().fold(issuer, |issuer, party| {
-            issuer.authorized_party(party.clone())
-        });
+        let issuer = parties
+            .iter()
+            .try_fold(issuer, |issuer, party| {
+                issuer.authorized_party(party.clone())
+            })
+            .expect("each named client is a client");
         config = config.with_issuer(issuer);
     }
 

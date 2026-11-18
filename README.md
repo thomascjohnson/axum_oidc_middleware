@@ -30,7 +30,7 @@ async fn app() -> Result<Router, axum_oidc_middleware::AuthError> {
         // never instead of it. It goes on the issuer because a client id is
         // unique within a realm, not across realms.
         Issuer::discover("https://sso.example.com/realms/myapp", ["myapp"])?
-            .authorized_party("myapp-client"),
+            .authorized_party("myapp-client")?,
     ]);
 
     // This call fails now if an issuer is unreachable or its keys will not load.

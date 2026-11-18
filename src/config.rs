@@ -6,7 +6,7 @@ use url::{Host, Url};
 
 use crate::error::AuthError;
 use crate::jwks::CachePolicy;
-use crate::types::{Audience, IssuerUrl};
+use crate::types::{Audience, AuthorizedParty, IssuerUrl};
 
 /// Ceiling for [`AuthConfig::leeway`], in seconds.
 ///
@@ -206,7 +206,7 @@ pub struct Issuer {
     /// `aud` required of a JWT access token and does not define `azp` at all.
     /// This option is Keycloak-shaped pragmatism, not a substitute for doing
     /// that.
-    authorized_parties: Vec<String>,
+    authorized_parties: Vec<AuthorizedParty>,
 }
 
 impl Issuer {
@@ -292,9 +292,25 @@ impl Issuer {
     /// The first call turns the gate on for *this issuer*; each one after admits
     /// another client. It cannot gate any other issuer — see
     /// [`Issuer::authorized_parties()`].
-    pub fn authorized_party(mut self, azp: impl Into<String>) -> Self {
-        self.authorized_parties.push(azp.into());
-        self
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Configuration`] when `azp` is empty. A blank entry is a
+    /// gate that never opens, and the way to leave the gate off is to not call
+    /// this method at all. The blank check used to happen at boot, in
+    /// `AuthConfig::validate`; it now happens here, where the argument is still
+    /// in view.
+    ///
+    /// This returns `Result` rather than `Self`, which is why a caller of the
+    /// builder chain needs one more `?`. Nothing that used to compile with a
+    /// *valid* client compiles differently; only the blank case is new, and it
+    /// is new as an error rather than as a value.
+    pub fn authorized_party(
+        mut self,
+        azp: impl TryInto<AuthorizedParty, Error = AuthError>,
+    ) -> Result<Self, AuthError> {
+        self.authorized_parties.push(azp.try_into()?);
+        Ok(self)
     }
 
     /// The `iss` value a token from this issuer must carry.
@@ -313,7 +329,7 @@ impl Issuer {
 
     /// The `azp` values a token from this issuer may name, empty when that
     /// issuer's gate is off.
-    pub fn authorized_parties(&self) -> &[String] {
+    pub fn authorized_parties(&self) -> &[AuthorizedParty] {
         &self.authorized_parties
     }
 
@@ -549,7 +565,7 @@ impl AuthConfig {
     /// accepted clients, consulted for every issuer, is what let a client id
     /// from one realm pass at another. This accessor aggregates for a log line
     /// and never for a decision.
-    pub fn all_authorized_parties(&self) -> Vec<String> {
+    pub fn all_authorized_parties(&self) -> Vec<AuthorizedParty> {
         union_of(
             self.issuers
                 .iter()
@@ -682,7 +698,7 @@ impl AuthConfig {
 
             // ── This issuer's own scope ──────────────────────────────────────
             //
-            // Two rules remain here. Each is stated per issuer, since there is no
+            // One rule remains here, stated per issuer since there is no
             // deployment-wide list left to check an issuer against.
             //
             // * Naming no audience is refused for *every* issuer, not merely a
@@ -692,17 +708,16 @@ impl AuthConfig {
             //   constructors already refuse an empty iterator, so this is the
             //   backstop for the field-by-field literals this module's tests
             //   build — the one shape a private field still permits, in here.
-            // * A blank `azp` is refused for the same reason it always was:
-            //   an entry nothing can name is a gate that never opens, not a
-            //   gate that is off. It stays here until `AuthorizedParty` takes
-            //   the check, which is where a blank entry is first written.
             //
-            // A blank *audience* is no longer checked here. `Audience::new`
-            // refuses one where the operator writes it, so the only route left
-            // to a blank entry is a crate-internal literal built with
-            // `Audience::from_wire`, which exists for the token path alone. The
-            // guard below is retained for exactly that shape, and is inert for
-            // anything a host can build.
+            // Two checks that used to sit beside it are gone, not weakened.
+            // A blank audience and a blank `azp` both used to be caught here,
+            // because both were `String` and either could be blank. Now
+            // `Audience::new` and `AuthorizedParty::new` refuse one where the
+            // operator writes it, and `AuthorizedParty` has no other
+            // constructor at all — `AuthorizedParty::new` is the only way to
+            // build one inside this crate or outside it. Neither value exists
+            // in a blank state, so a check for that state could only be dead
+            // code wearing the look of a safeguard.
             if issuer.audiences.is_empty() {
                 problems.push(format!(
                     "issuer `{iss}` names no audiences; every trusted issuer must \
@@ -722,15 +737,6 @@ impl AuthConfig {
             {
                 problems.push(format!(
                     "issuer `{}` is configured with an empty audience",
-                    issuer.iss
-                ));
-            }
-            if issuer.authorized_parties.iter().any(String::is_empty) {
-                problems.push(format!(
-                    "issuer `{}` is configured with an empty authorised party \
-                     (`azp`); an entry nothing can name is a gate that never \
-                     opens, not a gate that is off — omit `Issuer::authorized_party` \
-                     for this issuer to leave it off",
                     issuer.iss
                 ));
             }

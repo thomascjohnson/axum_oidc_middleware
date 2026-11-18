@@ -42,7 +42,7 @@
 //!     // is unique within a realm, not across realms: the `myclient` in this
 //!     // realm is not the `myclient` in any other.
 //!     Issuer::discover("https://sso.example.com/realms/sagaci", ["myaudience"])?
-//!         .authorized_party("myclient"),
+//!         .authorized_party("myclient")?,
 //! ]);
 //!
 //! // This call fails now if an issuer is unreachable or its keys will not load.
@@ -262,5 +262,5 @@ pub use config::{AuthConfig, Issuer, SignatureAlgorithm};
 pub use error::AuthError;
 pub use extract::{AuthUser, OptionalAuthUser, authorization, optional_auth, require_auth};
 pub use jwks::CachePolicy;
-pub use types::IssuerUrl;
+pub use types::{Audience, AuthorizedParty, IssuerUrl};
 pub use validator::Authenticator;
