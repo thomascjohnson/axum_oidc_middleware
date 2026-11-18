@@ -418,15 +418,25 @@ fn loopback_config() -> AuthConfig {
 }
 
 #[test]
-fn an_issuer_configured_with_an_empty_audience_is_refused() {
+fn an_issuer_with_blank_audience_is_refused_where_it_was_written() {
     // `Issuer::discover(URL, [""])` names a blank audience. No token ever
     // carries one, so every caller of that issuer is locked out by a setting
     // that reads as though it permitted something.
-    let err = problem(&config().with_issuer(Issuer::discover(URL, [""]).expect("valid issuer")));
+    //
+    // The refusal used to arrive at boot, from `validate`. It now arrives on the
+    // line that wrote the value, because `Audience::new` refuses blank and the
+    // constructor is the only way to name one. That is the improvement: the
+    // argument is still in view where the error is read.
+    let err = Issuer::discover(URL, [""]).expect_err("a blank audience is not an audience");
     assert!(
-        err.contains("configured with an empty audience") && err.contains(URL),
-        "the refusal should name the issuer whose audience is blank: {err}"
+        err.to_string().contains("audience is empty"),
+        "the refusal should say the audience is blank: {err}"
     );
+
+    // And the same for the second audience in a set, so the check is per entry
+    // rather than per list.
+    let err = Issuer::discover(URL, [AUDIENCE, ""]).expect_err("one blank entry is enough");
+    assert!(err.to_string().contains("audience is empty"), "{err}");
 }
 
 /// Every problem is reported at once, rather than the first one found.
@@ -436,28 +446,31 @@ fn an_issuer_configured_with_an_empty_audience_is_refused() {
 /// cycle is an outage window.
 #[test]
 fn validate_reports_every_problem_at_once() {
-    let err = problem(
-        &AuthConfig::empty()
-            .with_issuer(
-                Issuer::discover("http://identity.example", [AUDIENCE]).expect("valid issuer"),
-            )
-            .with_algorithms([])
-            // One issuer, two problems: the audience it named is blank, and so
-            // is the client it named. An empty *set* would be a third, but the
-            // constructor refuses that one before `validate` ever sees it, so
-            // this is the audience problem `validate` still owns.
-            .with_issuer(
-                Issuer::discover(URL, [""])
-                    .expect("valid issuer")
-                    .authorized_party(String::new()),
-            ),
-    );
+    // `validate` still owns every rule a type cannot state, and it reports all
+    // of them in one pass. On a deployment where the process dies at boot, each
+    // fix-and-restart is an outage window, so a config with four mistakes must
+    // take one cycle, not four.
+    //
+    // Two problems that used to appear here have moved *earlier*, not away: a
+    // blank audience and a blank `azp` are now refused by `Audience::new` and
+    // `AuthorizedParty::new`, on the line that wrote them. They cannot reach
+    // `validate` at all, so this test names four rules that still can.
+    let mut config = AuthConfig::empty()
+        .with_issuer(Issuer::discover("http://identity.example", [AUDIENCE]).expect("valid issuer"))
+        .with_algorithms([])
+        .with_policy(CachePolicy {
+            min_fetch_gap: Duration::from_millis(1),
+            ..CachePolicy::default()
+        });
+    config.leeway = 10_000;
+
+    let err = problem(&config);
 
     for expected in [
         "no allowed signature algorithms",
-        "empty authorised party",
         "requires https",
-        "configured with an empty audience",
+        "leeway of 10000s",
+        "min_fetch_gap under 1s",
     ] {
         assert!(err.contains(expected), "missing `{expected}` from: {err}");
     }

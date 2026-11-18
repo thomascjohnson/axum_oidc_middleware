@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::types::IssuerUrl;
+use crate::types::{Audience, IssuerUrl};
 
 /// Claims from a token that passed signature verification **and** the
 /// issuer/audience/expiry gates in [`Authenticator::authenticate`](crate::Authenticator::authenticate).
@@ -38,8 +38,14 @@ pub struct Claims {
     /// `aud` — audiences. RFC 9068 §2.2.1 requires a list, but Google's ID
     /// tokens carry a single string, so this accepts both forms. At least one
     /// element must have matched a configured audience.
+    ///
+    /// Each entry is an [`Audience`], so an `aud` value cannot be handed to the
+    /// `azp` gate or compared against
+    /// [`Issuer::authorized_parties()`](crate::Issuer::authorized_parties) by
+    /// mistake. The entries are what the issuer asserted, not a trust decision:
+    /// the audience gate decides, and it runs after the signature.
     #[serde(deserialize_with = "deserialize_audience")]
-    pub aud: Vec<String>,
+    pub aud: Vec<Audience>,
 
     /// `exp` — expiry, seconds since the Unix epoch. Required. The crate
     /// rejects a token without it.
@@ -124,24 +130,31 @@ impl Claims {
 ///
 /// A token with no audience says who it is *not* for. That is the one thing
 /// this API depends on, so an empty list is a rejection rather than a pass.
-fn deserialize_audience<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+fn deserialize_audience<'de, D>(deserializer: D) -> Result<Vec<Audience>, D::Error>
 where
     D: Deserializer<'de>,
 {
+    // Named apart from [`Audience`] on purpose: this is the *shape* the claim
+    // arrived in, not a claim value. One variant holds the one-element list
+    // Google sends as a bare string.
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Audience {
+    enum AudienceShape {
         One(String),
         Many(Vec<String>),
     }
 
-    let aud = match Audience::deserialize(deserializer)? {
-        Audience::One(one) => vec![one],
-        Audience::Many(many) => many,
+    let aud = match AudienceShape::deserialize(deserializer)? {
+        AudienceShape::One(one) => vec![one],
+        AudienceShape::Many(many) => many,
     };
 
     if aud.is_empty() {
         return Err(serde::de::Error::custom("`aud` must not be empty"));
     }
-    Ok(aud)
+    // A blank entry is *not* refused here. It cannot match any configured
+    // audience, so the gate rejects the token and names what it saw. Refusing
+    // it at deserialisation would replace that message with a serde failure and
+    // tell an operator less about a token they already have in hand.
+    Ok(aud.into_iter().map(Audience::from_wire).collect())
 }

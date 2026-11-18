@@ -6,7 +6,7 @@ use url::{Host, Url};
 
 use crate::error::AuthError;
 use crate::jwks::CachePolicy;
-use crate::types::IssuerUrl;
+use crate::types::{Audience, IssuerUrl};
 
 /// Ceiling for [`AuthConfig::leeway`], in seconds.
 ///
@@ -159,7 +159,7 @@ pub struct Issuer {
     /// private, so no literal can be assembled around them.
     /// [`AuthConfig::validate`] repeats the check anyway, for the literals this
     /// module's own tests build.
-    audiences: Vec<String>,
+    audiences: Vec<Audience>,
     /// The `azp` values that a token *from this issuer* may name. Optional.
     ///
     /// # Why this list is per issuer
@@ -220,7 +220,7 @@ impl Issuer {
     /// [`Self::authorized_party`].
     pub fn discover(
         iss: impl TryInto<IssuerUrl, Error = AuthError>,
-        audiences: impl IntoIterator<Item = impl Into<String>>,
+        audiences: impl IntoIterator<Item = impl TryInto<Audience, Error = AuthError>>,
     ) -> Result<Self, AuthError> {
         let iss = iss.try_into()?;
         Self::new(iss, None, audiences)
@@ -234,7 +234,7 @@ impl Issuer {
     pub fn with_jwks_url(
         iss: impl TryInto<IssuerUrl, Error = AuthError>,
         jwks_url: Url,
-        audiences: impl IntoIterator<Item = impl Into<String>>,
+        audiences: impl IntoIterator<Item = impl TryInto<Audience, Error = AuthError>>,
     ) -> Result<Self, AuthError> {
         let iss = iss.try_into()?;
         Self::new(iss, Some(jwks_url), audiences)
@@ -245,7 +245,7 @@ impl Issuer {
     fn new(
         iss: IssuerUrl,
         jwks_url: Option<Url>,
-        audiences: impl IntoIterator<Item = impl Into<String>>,
+        audiences: impl IntoIterator<Item = impl TryInto<Audience, Error = AuthError>>,
     ) -> Result<Self, AuthError> {
         // The scheme is deliberately not looked at here. Whether http is
         // tolerable is a deployment-wide decision that [`AuthConfig::validate`]
@@ -262,7 +262,10 @@ impl Issuer {
         // audience". So it is refused here, at the only point that can see it,
         // rather than left for `validate` to catch after a caller already holds
         // an `Issuer` that looks fine.
-        let audiences: Vec<String> = audiences.into_iter().map(Into::into).collect();
+        let audiences: Vec<Audience> = audiences
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_, _>>()?;
         if audiences.is_empty() {
             return Err(AuthError::Configuration(format!(
                 "issuer `{iss}` names no audiences; every trusted issuer must state \
@@ -304,7 +307,7 @@ impl Issuer {
     }
 
     /// The `aud` values a token from this issuer may name.
-    pub fn audiences(&self) -> &[String] {
+    pub fn audiences(&self) -> &[Audience] {
         &self.audiences
     }
 
@@ -404,8 +407,11 @@ pub struct AuthConfig {
 /// Takes the values rather than an `Issuer` and a way to pick a field off it.
 /// The only two callers differ in which field they flatten, and that is a
 /// question `flat_map` already answers at the call site.
-fn union_of<'a>(values: impl IntoIterator<Item = &'a String>) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+fn union_of<'a, T>(values: impl IntoIterator<Item = &'a T>) -> Vec<T>
+where
+    T: Clone + PartialEq + 'a,
+{
+    let mut out: Vec<T> = Vec::new();
     for value in values {
         if !out.contains(value) {
             out.push(value.clone());
@@ -529,7 +535,7 @@ impl AuthConfig {
     /// it is the widest set the deployment ever intended, and the narrow question
     /// is answered after the signature by the per-issuer set. A host also logs it
     /// at startup. Neither reads it as permission for one token.
-    pub fn all_audiences(&self) -> Vec<String> {
+    pub fn all_audiences(&self) -> Vec<Audience> {
         union_of(self.issuers.iter().flat_map(|issuer| &issuer.audiences))
     }
 
@@ -676,8 +682,7 @@ impl AuthConfig {
 
             // ── This issuer's own scope ──────────────────────────────────────
             //
-            // Three rules, all decided at boot because all are invisible at
-            // request time. Each one is stated per issuer, since there is no
+            // Two rules remain here. Each is stated per issuer, since there is no
             // deployment-wide list left to check an issuer against.
             //
             // * Naming no audience is refused for *every* issuer, not merely a
@@ -687,10 +692,17 @@ impl AuthConfig {
             //   constructors already refuse an empty iterator, so this is the
             //   backstop for the field-by-field literals this module's tests
             //   build — the one shape a private field still permits, in here.
-            // * A blank entry could never match, which is an outage disguised
-            //   as a security control.
-            // * `azp` is scoped the same way. Its blank check moved here from
-            //   the deployment-wide list for the same reason as above.
+            // * A blank `azp` is refused for the same reason it always was:
+            //   an entry nothing can name is a gate that never opens, not a
+            //   gate that is off. It stays here until `AuthorizedParty` takes
+            //   the check, which is where a blank entry is first written.
+            //
+            // A blank *audience* is no longer checked here. `Audience::new`
+            // refuses one where the operator writes it, so the only route left
+            // to a blank entry is a crate-internal literal built with
+            // `Audience::from_wire`, which exists for the token path alone. The
+            // guard below is retained for exactly that shape, and is inert for
+            // anything a host can build.
             if issuer.audiences.is_empty() {
                 problems.push(format!(
                     "issuer `{iss}` names no audiences; every trusted issuer must \
@@ -703,7 +715,11 @@ impl AuthConfig {
                     iss = issuer.iss,
                 ));
             }
-            if issuer.audiences.iter().any(String::is_empty) {
+            if issuer
+                .audiences
+                .iter()
+                .any(|audience| audience.as_str().is_empty())
+            {
                 problems.push(format!(
                     "issuer `{}` is configured with an empty audience",
                     issuer.iss

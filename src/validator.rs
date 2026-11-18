@@ -39,7 +39,7 @@ use crate::claims::Claims;
 use crate::config::{AuthConfig, Issuer, SignatureAlgorithm};
 use crate::error::AuthError;
 use crate::jwks::{CachePolicy, JwksRegistry};
-use crate::types::IssuerUrl;
+use crate::types::{Audience, IssuerUrl};
 
 /// Verifies bearer tokens from one or more OIDC issuers.
 ///
@@ -73,7 +73,7 @@ struct Inner {
     /// it, so any trusted issuer could vouch for any audience the deployment
     /// served. The field must not be able to grow back into that by being
     /// reached for out of habit.
-    audiences_for_reporting: Vec<String>,
+    audiences_for_reporting: Vec<Audience>,
     /// Per-issuer audience sets, keyed by the exact `iss`, copied once here
     /// rather than walked per request.
     ///
@@ -89,7 +89,7 @@ struct Inner {
     /// Every entry comes straight from an `Issuer` that had to name at least
     /// one audience to exist. There is no ceiling to intersect with and no
     /// inherit branch: the answer for an issuer is the list on that issuer.
-    issuer_audiences: HashMap<IssuerUrl, Vec<String>>,
+    issuer_audiences: HashMap<IssuerUrl, Vec<Audience>>,
     /// Every `azp` named by any issuer, derived once, for the accessor.
     /// Reporting only — nothing here accepts a token, and the name says so.
     authorized_parties_for_reporting: Vec<String>,
@@ -163,7 +163,7 @@ impl Authenticator {
         // deployment-wide list: the `Issuer` is the only place either scope is
         // stated, and `validate` already refused an issuer that named no
         // audience.
-        let issuer_audiences: HashMap<IssuerUrl, Vec<String>> = config
+        let issuer_audiences: HashMap<IssuerUrl, Vec<Audience>> = config
             .issuers
             .iter()
             .map(|issuer| (issuer.iss().clone(), issuer.audiences().to_vec()))
@@ -209,13 +209,13 @@ impl Authenticator {
     /// checked against on its own. `the_reporting_unions_match_the_per_issuer_sets`
     /// pins the two to the same value. The `all_` prefix marks the width, so a
     /// caller cannot mistake it for the narrower answer beside it.
-    pub fn all_audiences(&self) -> &[String] {
+    pub fn all_audiences(&self) -> &[Audience] {
         &self.inner.audiences_for_reporting
     }
 
     /// The `aud` values a token from `iss` may name, or `None` when no such
     /// issuer is configured. This is the set the audience gate enforces.
-    pub fn issuer_audiences(&self, iss: &str) -> Option<&[String]> {
+    pub fn issuer_audiences(&self, iss: &IssuerUrl) -> Option<&[Audience]> {
         self.inner.issuer_audiences.get(iss).map(Vec::as_slice)
     }
 
@@ -838,14 +838,14 @@ async fn discover(issuer: &Issuer, allow_http: bool) -> Result<Url, AuthError> {
 /// Three, then the count. Three is enough to spot the `aud`-misconfigured class
 /// by eye. The count matters because "and 497 you are not shown" tells the
 /// operator where to look. One client, or the IdP's whole audience model.
-fn aud_hint(aud: &[String]) -> String {
+fn aud_hint(aud: &[Audience]) -> String {
     const SHOWN: usize = 3;
     // `take` rather than `join`: the whole point is to never build the long
     // string, so the bound has to be structural and not a trim afterwards.
     let shown = aud
         .iter()
         .take(SHOWN)
-        .cloned()
+        .map(Audience::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     // `saturating_sub`, matched on zero — not `checked_sub` matched on `None`.
@@ -892,8 +892,11 @@ mod tests {
     /// claiming a remainder.
     #[test]
     fn aud_hint_never_announces_a_remainder_of_zero() {
-        let list =
-            |n: usize| -> Vec<String> { (0..n).map(|k| format!("aud-{k}")).collect::<Vec<_>>() };
+        let list = |n: usize| -> Vec<Audience> {
+            (0..n)
+                .map(|k| Audience::new(format!("aud-{k}")).expect("an audience"))
+                .collect::<Vec<_>>()
+        };
 
         assert_eq!(aud_hint(&list(0)), "");
         assert_eq!(aud_hint(&list(1)), "aud-0");
@@ -1109,10 +1112,11 @@ mod tests {
         // The same answer, recomputed from the maps the gates actually read.
         // This is the assertion that would fail if a future edit updated one
         // copy and not the other.
-        let mut derived: Vec<String> = Vec::new();
+        let mut derived: Vec<Audience> = Vec::new();
         for iss in ["https://issuer.example", "https://other.example"] {
+            let iss = IssuerUrl::parse(iss).expect("a test issuer is a URL");
             for aud in auth
-                .issuer_audiences(iss)
+                .issuer_audiences(&iss)
                 .expect("every configured issuer has an entry")
             {
                 if !derived.contains(aud) {

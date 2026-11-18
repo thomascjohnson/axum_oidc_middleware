@@ -241,6 +241,194 @@ impl<'de> serde::Deserialize<'de> for IssuerUrl {
     }
 }
 
+/// The mechanical impls shared by the string identifiers in this module.
+///
+/// `Audience` and `AuthorizedParty` differ in what they mean and in the sentence
+/// their constructor refuses with. Everything else — `Display`, equality,
+/// hashing, the serde impls and the `TryFrom` conversions — is identical, and
+/// writing it twice invites the two copies to drift apart in a way no test would
+/// catch.
+///
+/// Each type's own constructor stays hand-written, because the message it emits
+/// is the part an operator reads and the part that has to name the right field.
+///
+/// # Equality and hashing
+///
+/// Both are over the wrapped string, so a `Vec<Audience>` can be compared and a
+/// `HashSet` can be built without the newtype changing what equality means.
+///
+/// # The serde split
+///
+/// `Serialize` is transparent, so a `Claims` value round-trips to the JSON it
+/// came from and no host's log line changes shape. `Deserialize` accepts any
+/// string, including a blank one: it is on the token path, where the value is
+/// untrusted input rather than the operator's statement, and the gate that reads
+/// it reports what it saw. Validation belongs in the constructor.
+macro_rules! string_identifier {
+    ($name:ident) => {
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        // `Debug` keeps the quoting a `String` had, so `?vec` renders
+        // `["my-audience"]` exactly as it did before this type existed. The
+        // TRACE line in `extract` carries `aud`, and `tests/observability.rs`
+        // pins its shape — a newtype must not quietly reformat a log line.
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                fmt::Debug::fmt(&self.0, f)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.0 == other.0
+            }
+        }
+
+        impl Eq for $name {}
+
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.0.hash(state);
+            }
+        }
+
+        // Comparison against a literal, so a host or a test can write
+        // `claims.aud[0] == "myapp"`. This is convenience, not proof: it lets
+        // an arbitrary string be compared, which is fine because no gate
+        // decides anything from this operator.
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.0 == *other
+            }
+        }
+
+        // So `Vec<Audience> == Vec<String>` compiles. `Vec`'s `PartialEq`
+        // delegates to its elements, which is what lets a test compare a parsed
+        // claim against the literals it was built from without a `map`.
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl serde::Serialize for $name {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                String::deserialize(deserializer).map(Self)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = AuthError;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = AuthError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&String> for $name {
+            type Error = AuthError;
+
+            fn try_from(value: &String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+    };
+}
+
+/// One `aud` value a token may name: the resource this API is, as the issuer
+/// writes it.
+///
+/// # Why a type rather than a `String`
+///
+/// Two lists are compared against two different claims, and both used to be
+/// `Vec<String>`. Nothing stopped an `aud` list being checked against an `azp`
+/// set, and `src/validator.rs` did exactly that kind of comparison on both. With
+/// a distinct type per role, mixing them is a compile error rather than a test
+/// that has to notice.
+///
+/// # The one asymmetry: `new` refuses blank, `Deserialize` does not
+///
+/// An empty audience can never match, so a blank entry in the *configuration* is
+/// an outage disguised as a security control. The operator wrote it, so
+/// [`Audience::new`] refuses it where they wrote it.
+///
+/// [`Claims::aud`](crate::Claims::aud) is a different matter. It records what
+/// the issuer asserted, which is untrusted input. A blank entry there is already
+/// refused by the audience gate, which names the value it saw. Rejecting it
+/// during deserialisation would replace that message with a serde failure and
+/// tell an operator less. So the wire shape is taken as it arrives, and the gate
+/// decides.
+#[derive(Clone)]
+pub struct Audience(String);
+
+impl Audience {
+    /// Take one audience a token from this issuer may name.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Configuration`] when `value` is empty. An entry nothing can
+    /// ever name is a gate that never opens, which reads in a config file as
+    /// though it permitted something.
+    pub fn new(value: impl Into<String>) -> Result<Self, AuthError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(AuthError::Configuration(
+                "audience is empty; an entry nothing can name is a gate that never opens, \
+                 not a gate that is off"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// The claim text, exactly as configured.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Take a value straight off the wire, without the blank check.
+    ///
+    /// For the token path only. `Claims::aud` records what the issuer
+    /// asserted, and a blank entry there is untrusted input that the audience
+    /// gate refuses by name. See the type's documentation for why the two
+    /// constructors differ.
+    pub(crate) fn from_wire(value: String) -> Self {
+        Self(value)
+    }
+}
+
+string_identifier!(Audience);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,5 +542,76 @@ mod tests {
         set.insert(upper);
         set.insert(lower);
         assert_eq!(set.len(), 2, "but they are two different issuers");
+    }
+
+    /// A blank audience is refused where the operator writes it.
+    ///
+    /// It can never match, so it locks every caller of that issuer out while
+    /// reading in a config file as though it permitted something. The refusal
+    /// used to happen at boot, in `AuthConfig::validate`; now it happens on the
+    /// line that wrote the value, where the argument is still in view.
+    #[test]
+    fn a_blank_audience_is_refused_at_construction() {
+        let err = Audience::new("").expect_err("a blank audience names nothing");
+
+        assert!(
+            matches!(err, AuthError::Configuration(_)),
+            "the operator wrote this, so it is theirs to fix: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("audience is empty"),
+            "say the audience is blank: {err}"
+        );
+    }
+
+    /// The token path takes a blank entry as it arrives.
+    ///
+    /// `Claims::aud` records what the issuer asserted. Refusing a blank there
+    /// would turn a rejection the audience gate explains into a serde failure
+    /// inside `decode`, which names nothing. So the wire constructor skips the
+    /// check and the gate does the refusing.
+    #[test]
+    fn the_wire_constructor_takes_a_blank_entry() {
+        let blank = Audience::from_wire(String::new());
+        assert_eq!(blank.as_str(), "");
+        assert_eq!(blank, "", "it still compares as the text it holds");
+    }
+
+    /// The wire shape of a `Claims` value does not move.
+    ///
+    /// A host reads `aud` out of a verified token and may log or forward the
+    /// JSON. Transparent serialisation is what keeps that from changing shape
+    /// when the field became a newtype, and it is asserted rather than assumed.
+    #[test]
+    fn an_audience_serialises_as_a_bare_string() {
+        let one = Audience::new("my-api").expect("an audience");
+        assert_eq!(
+            serde_json::to_string(&one).expect("an audience serialises"),
+            "\"my-api\""
+        );
+
+        let list = vec![
+            Audience::new("a").expect("an audience"),
+            Audience::new("b").expect("an audience"),
+        ];
+        let json = serde_json::to_string(&list).expect("a list serialises");
+        assert_eq!(json, "[\"a\",\"b\"]");
+        assert_eq!(
+            serde_json::from_str::<Vec<Audience>>(&json).expect("and reads back"),
+            list
+        );
+    }
+
+    /// Comparing against a literal compiles, which is what keeps a host's
+    /// `if aud == "my-app"` readable.
+    #[test]
+    fn an_audience_compares_against_a_literal() {
+        let aud = Audience::new("my-api").expect("an audience");
+        assert_eq!(aud, "my-api");
+        assert_eq!(aud, "my-api".to_owned());
+        assert_ne!(aud, "other");
+        // The `Vec` form delegates to the elements, which is how a test compares
+        // a parsed claim against the literals it was built from.
+        assert_eq!(vec![aud], vec!["my-api".to_owned()]);
     }
 }
