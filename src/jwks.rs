@@ -63,6 +63,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::error::AuthError;
+use crate::types::IssuerUrl;
 
 /// Largest JWKS body accepted, in bytes. This guards against a compromised or
 /// misbehaving issuer turning one token request into memory exhaustion.
@@ -145,7 +146,7 @@ struct RefreshState {
 /// One identity provider's keys, and how to keep them current.
 #[derive(Debug)]
 struct IssuerSlot {
-    iss: String,
+    iss: IssuerUrl,
     jwks_url: Url,
     /// What requests are served from. This is swapped wholesale, so a reader
     /// either sees the old bundle or the new one and never a half-installed
@@ -155,7 +156,7 @@ struct IssuerSlot {
 }
 
 impl IssuerSlot {
-    fn new(iss: String, jwks_url: Url) -> Self {
+    fn new(iss: IssuerUrl, jwks_url: Url) -> Self {
         Self {
             iss,
             jwks_url,
@@ -331,8 +332,9 @@ impl Drop for Flight<'_> {
 pub struct JwksRegistry {
     http: reqwest::Client,
     policy: CachePolicy,
-    /// Keyed by the exact `iss` string.
-    slots: HashMap<String, IssuerSlot>,
+    /// Keyed by the exact `iss`. [`IssuerUrl`] hashes on the claim text, so a
+    /// lookup borrows the verified `iss` and allocates nothing.
+    slots: HashMap<IssuerUrl, IssuerSlot>,
     /// `alg` names the JWS header and the JWK may use, e.g. `RS256`.
     allowed_algorithms: Vec<String>,
 }
@@ -345,9 +347,12 @@ impl JwksRegistry {
     ///
     /// # Errors
     ///
-    /// [`AuthError::Configuration`] when `iss` or the algorithm list is empty.
+    /// [`AuthError::Configuration`] when the algorithm list is empty. An
+    /// unusable `iss` cannot reach here: [`IssuerUrl`] parsed before an
+    /// [`Issuer`](crate::Issuer) existed, so the check that used to live at
+    /// this line is now the constructor of the type in the tuple.
     pub fn new(
-        issuers: impl IntoIterator<Item = (String, Url)>,
+        issuers: impl IntoIterator<Item = (IssuerUrl, Url)>,
         allowed_algorithms: &[String],
         policy: CachePolicy,
         allow_http: bool,
@@ -376,8 +381,8 @@ impl JwksRegistry {
     }
 
     /// Every issuer this registry can serve.
-    pub fn issuers(&self) -> impl Iterator<Item = &str> {
-        self.slots.keys().map(String::as_str)
+    pub fn issuers(&self) -> impl Iterator<Item = &IssuerUrl> {
+        self.slots.keys()
     }
 
     /// Fetch every issuer's keys now, so a bad URL or an unreachable provider
@@ -429,7 +434,11 @@ impl JwksRegistry {
     /// [`AuthError::ProviderUnavailable`] when the issuer has no keys at all
     /// and cannot be reached. The two are distinct so an outage is not logged
     /// as an attack.
-    pub async fn key_for(&self, iss: &str, kid: Option<&str>) -> Result<DecodingKey, AuthError> {
+    pub async fn key_for(
+        &self,
+        iss: &IssuerUrl,
+        kid: Option<&str>,
+    ) -> Result<DecodingKey, AuthError> {
         let slot = self
             .slots
             .get(iss)
@@ -669,7 +678,7 @@ impl JwksRegistry {
             ))
         })?;
 
-        let keys = self.convert_keys(document.keys, &slot.iss);
+        let keys = self.convert_keys(document.keys, slot.iss.as_str());
         if keys.is_empty() {
             return Err(AuthError::ProviderUnavailable(format!(
                 "{iss} published no usable keys",
@@ -858,7 +867,7 @@ mod tests {
     #[test]
     fn a_registry_with_no_accepted_algorithms_is_refused_at_construction() {
         let issuers = [(
-            "https://issuer.example".to_owned(),
+            IssuerUrl::parse("https://issuer.example").expect("a URL"),
             Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL"),
         )];
 
@@ -908,7 +917,7 @@ mod tests {
             .expect("a free port")
             .local_addr()
             .expect("the address it bound");
-        let iss = format!("http://{addr}");
+        let iss = IssuerUrl::parse(&format!("http://{addr}")).expect("a URL");
         let jwks_url = Url::parse(&format!("{iss}/jwks.json")).expect("a JWKS URL");
 
         let registry = JwksRegistry::new(
@@ -980,7 +989,7 @@ mod tests {
         const BOOM: &str = "poisoning the refresh lock, on purpose";
 
         let slot = IssuerSlot::new(
-            "https://demo.example".to_owned(),
+            IssuerUrl::parse("https://demo.example").expect("a URL"),
             Url::parse("https://demo.example/jwks.json").expect("a JWKS URL"),
         );
 

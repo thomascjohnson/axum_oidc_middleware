@@ -84,7 +84,7 @@ async fn accepts_a_token_from_a_discovered_issuer() {
         .await
         .expect("a correctly signed token is accepted");
 
-    assert_eq!(claims.iss, h.iss);
+    assert_eq!(claims.iss.as_str(), h.iss);
     assert_eq!(claims.sub, "user-123");
     assert_eq!(claims.aud, vec![AUDIENCE.to_owned()]);
     assert_eq!(
@@ -885,7 +885,7 @@ async fn reports_the_issuers_it_will_accept() {
     let second = TestKey::generate("k2");
     let h = Harness::start(&[first.clone(), second.clone()]).await;
 
-    let issuers: Vec<&str> = h.auth.issuers().collect();
+    let issuers: Vec<&str> = h.auth.issuers().map(|iss| iss.as_str()).collect();
     assert_eq!(
         issuers,
         vec![h.iss.as_str()],
@@ -900,7 +900,7 @@ async fn reports_the_issuers_it_will_accept() {
         .await
         .expect("start with two issuers");
 
-    let mut reported: Vec<String> = both.issuers().map(str::to_owned).collect();
+    let mut reported: Vec<String> = both.issuers().map(|iss| iss.as_str().to_owned()).collect();
     reported.sort();
     assert_eq!(reported, {
         let mut expected = vec![one.iss(), two.iss()];

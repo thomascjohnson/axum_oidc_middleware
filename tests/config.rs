@@ -127,7 +127,7 @@ async fn an_issuer_at_a_path_is_discovered_at_that_path() {
         .authenticate(&claims)
         .await
         .expect("the realm's own token authenticates");
-    assert_eq!(verified.iss, stub.iss());
+    assert_eq!(verified.iss.as_str(), stub.iss());
     assert_eq!(verified.sub, "user-123");
 }
 
@@ -203,31 +203,26 @@ fn an_issuer_cannot_be_assembled_around_its_constructors() {
 
 /// The one route the private audience list did **not** close.
 ///
-/// A literal cannot be written from outside the crate, but `iss` is still `pub`,
-/// so a caller can assign a value the constructors never parsed:
+/// 0.2.0 let a caller assign `issuer.iss = "identity.example".to_owned()`, which
+/// left `validate` to notice the missing scheme at boot. That route is gone: the
+/// field is private and typed, and the only way to obtain its type is
+/// [`IssuerUrl::parse`], which refuses both a missing scheme and an empty
+/// string. This test pins what replaced it — the value a constructor accepted is
+/// what `iss()` returns, and there is no setter beside it to change that later.
 ///
-/// ```ignore
-/// let mut issuer = Issuer::discover(URL, ["my-api"])?;
-/// issuer.iss = "identity.example".to_owned(); // skips `Url::parse`
-/// ```
-///
-/// That leaves `validate` — not the constructor — as the last gate for a
-/// mutated value, which is why it re-checks rather than trusting where the
-/// value came from. This test exists because the shape above argues the route is
-/// gone, and a claim like that needs a test standing behind it.
+/// The text is compared byte for byte, so a trailing slash still makes a
+/// different issuer. That is the property a host's tokens depend on.
 #[test]
-fn validate_still_rechecks_an_issuer_mutated_after_construction() {
-    let mut unparseable = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
-    unparseable.iss = "identity.example".to_owned(); // the scheme went missing
-    let err = problem(&AuthConfig::empty().with_issuer(unparseable));
-    assert!(err.contains("is not a URL"), "{err}");
+fn the_issuer_text_is_settled_by_the_constructor() {
+    let issuer = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
+    assert_eq!(issuer.iss().as_str(), URL);
 
-    let mut empty = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
-    empty.iss = String::new();
-    let err = problem(&AuthConfig::empty().with_issuer(empty));
-    assert!(
-        err.contains("issuer is empty"),
-        "an emptied issuer should be named as such: {err}"
+    let slashed = Issuer::discover(format!("{URL}/"), [AUDIENCE]).expect("valid issuer");
+    assert_eq!(slashed.iss().as_str(), format!("{URL}/"));
+    assert_ne!(
+        issuer.iss(),
+        slashed.iss(),
+        "a trailing slash is a different issuer, and the type must not merge them"
     );
 }
 

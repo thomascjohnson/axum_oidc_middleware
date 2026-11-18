@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::types::IssuerUrl;
+
 /// Claims from a token that passed signature verification **and** the
 /// issuer/audience/expiry gates in [`Authenticator::authenticate`](crate::Authenticator::authenticate).
 ///
@@ -24,7 +26,14 @@ pub struct Claims {
     /// `iss` — the issuer. The crate compares it with the trusted issuer whose
     /// key verified the signature. It rejects a token whose `iss` did not
     /// verify, before it builds this value.
-    pub iss: String,
+    ///
+    /// Typed, so an unparseable `iss` cannot be carried here: a value of this
+    /// type always parsed as an absolute URL. That is *shape*, not trust. It
+    /// becomes a trusted identifier only because
+    /// [`Authenticator::authenticate`](crate::Authenticator::authenticate)
+    /// matched it against a configured issuer and that issuer's key verified the
+    /// signature.
+    pub iss: IssuerUrl,
 
     /// `aud` — audiences. RFC 9068 §2.2.1 requires a list, but Google's ID
     /// tokens carry a single string, so this accepts both forms. At least one

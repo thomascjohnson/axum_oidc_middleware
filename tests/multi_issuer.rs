@@ -397,8 +397,16 @@ async fn both_issuers_are_verified_by_their_own_keys_at_the_same_time() {
         .await
         .expect("issuer B authenticates against its own key, in the same process");
 
-    assert_eq!(from_a.iss, h.iss_a, "A's verified claims carry A's issuer");
-    assert_eq!(from_b.iss, h.iss_b, "B's verified claims carry B's issuer");
+    assert_eq!(
+        from_a.iss.as_str(),
+        h.iss_a,
+        "A's verified claims carry A's issuer"
+    );
+    assert_eq!(
+        from_b.iss.as_str(),
+        h.iss_b,
+        "B's verified claims carry B's issuer"
+    );
     assert_ne!(from_a.iss, from_b.iss, "and they are different issuers");
     assert_eq!(from_a.sub, "user-123", "A's subject survives the verifier");
     assert_eq!(from_b.sub, "user-123", "and so does B's");
@@ -679,7 +687,7 @@ async fn a_lone_issuer_naming_its_own_audience_boots_and_authenticates() {
         .await
         .expect("and authenticate the tokens it authenticates today");
     assert_eq!(claims.sub, "user-123");
-    assert_eq!(claims.iss, iss);
+    assert_eq!(claims.iss.as_str(), iss);
 
     // Naming one audience means naming only that one. An audience this issuer
     // never claimed was never in scope.

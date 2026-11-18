@@ -254,6 +254,7 @@ mod error;
 mod extract;
 mod http;
 mod jwks;
+mod types;
 mod validator;
 
 pub use claims::Claims;
@@ -261,4 +262,5 @@ pub use config::{AuthConfig, Issuer, SignatureAlgorithm};
 pub use error::AuthError;
 pub use extract::{AuthUser, OptionalAuthUser, authorization, optional_auth, require_auth};
 pub use jwks::CachePolicy;
+pub use types::IssuerUrl;
 pub use validator::Authenticator;

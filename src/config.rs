@@ -6,6 +6,7 @@ use url::{Host, Url};
 
 use crate::error::AuthError;
 use crate::jwks::CachePolicy;
+use crate::types::IssuerUrl;
 
 /// Ceiling for [`AuthConfig::leeway`], in seconds.
 ///
@@ -120,7 +121,12 @@ pub struct Issuer {
     /// The exact `iss` claim value to require. Compared byte-for-byte:
     /// `https://example.com` and `https://example.com/` are different issuers
     /// to RFC 9068 validators, so this crate does not guess between them.
-    pub iss: String,
+    ///
+    /// Private, and typed, so no value reaches this field that did not parse.
+    /// Read it with [`Self::iss`]. A `pub` field was the one route around the
+    /// constructors: assigning a scheme-less string left `validate` to notice
+    /// at boot, after an `Issuer` that looked settled already existed.
+    iss: IssuerUrl,
     /// Where to fetch keys. `None` means discover the location from
     /// `<iss>/.well-known/openid-configuration`.
     pub jwks_url: Option<Url>,
@@ -213,14 +219,11 @@ impl Issuer {
     /// without naming it — see [`Issuer::audiences()`]. Gate on `azp` with
     /// [`Self::authorized_party`].
     pub fn discover(
-        iss: impl Into<String>,
+        iss: impl TryInto<IssuerUrl, Error = AuthError>,
         audiences: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, AuthError> {
-        let iss = iss.into();
-        let url = Url::parse(&iss).map_err(|err| {
-            AuthError::Configuration(format!("issuer `{iss}` is not a URL: {err}"))
-        })?;
-        Self::new(iss, url, None, audiences)
+        let iss = iss.try_into()?;
+        Self::new(iss, None, audiences)
     }
 
     /// Skip discovery and name the JWKS endpoint directly. Use this for an
@@ -229,41 +232,30 @@ impl Issuer {
     ///
     /// `audiences` is required for the same reason [`Self::discover`] takes it.
     pub fn with_jwks_url(
-        iss: impl Into<String>,
+        iss: impl TryInto<IssuerUrl, Error = AuthError>,
         jwks_url: Url,
         audiences: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, AuthError> {
-        let iss = iss.into();
-        Self::new(
-            iss.clone(),
-            Url::parse(&iss).map_err(|err| {
-                AuthError::Configuration(format!("issuer `{iss}` is not a URL: {err}"))
-            })?,
-            Some(jwks_url),
-            audiences,
-        )
+        let iss = iss.try_into()?;
+        Self::new(iss, Some(jwks_url), audiences)
     }
 
     /// Both the issuer and its keys must use HTTPS: these answers establish
     /// trust, and HTTP lets anyone on the path answer them.
     fn new(
-        iss: String,
-        url: Url,
+        iss: IssuerUrl,
         jwks_url: Option<Url>,
         audiences: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<Self, AuthError> {
-        if iss.is_empty() {
-            return Err(AuthError::Configuration("issuer is empty".to_owned()));
-        }
-        // The code does not look at the scheme here. Whether http is tolerable
-        // is a deployment-wide decision that [`AuthConfig::validate`] enforces
-        // once. That lets tests build a loopback issuer while production
-        // defaults to https-only.
-        if url.query().is_some() || url.fragment().is_some() {
-            return Err(AuthError::Configuration(format!(
-                "issuer `{iss}` must not carry a query or fragment"
-            )));
-        }
+        // The scheme is deliberately not looked at here. Whether http is
+        // tolerable is a deployment-wide decision that [`AuthConfig::validate`]
+        // enforces once. That lets tests build a loopback issuer while
+        // production defaults to https-only.
+        //
+        // Emptiness, a scheme, a query and a fragment were all refused by
+        // `IssuerUrl::parse` before this point, so this function has no URL
+        // problem left to report.
+        //
         // Arity cannot see inside an iterator, so `[]` reaches here. An empty
         // set is the *unspecified* state, not a settled one, and once there is
         // no deployment-wide list to inherit it has no reading but "any
@@ -302,6 +294,15 @@ impl Issuer {
         self
     }
 
+    /// The `iss` value a token from this issuer must carry.
+    ///
+    /// Compared byte-for-byte, so the exact text the operator wrote is what a
+    /// token has to match. There is no setter: the value is settled when the
+    /// issuer is constructed.
+    pub fn iss(&self) -> &IssuerUrl {
+        &self.iss
+    }
+
     /// The `aud` values a token from this issuer may name.
     pub fn audiences(&self) -> &[String] {
         &self.audiences
@@ -314,25 +315,8 @@ impl Issuer {
     }
 
     /// Return `<iss>/.well-known/openid-configuration`, per RFC 8414 §3.1.
-    pub(crate) fn discovery_url(&self) -> Result<Url, AuthError> {
-        let mut url = Url::parse(&self.iss).map_err(|err| {
-            AuthError::Configuration(format!(
-                "issuer `{iss}` is not a URL: {err}",
-                iss = self.iss
-            ))
-        })?;
-        // RFC 8414 appends to the issuer's path. `set_path` replaces the path
-        // rather than joining it, so the code carries the existing path
-        // through. Dropping it would send every Keycloak realm's discovery
-        // request to `/`.
-        let path = url.path().to_string();
-        let path = if path.ends_with('/') {
-            format!("{path}.well-known/openid-configuration")
-        } else {
-            format!("{path}/.well-known/openid-configuration")
-        };
-        url.set_path(&path);
-        Ok(url)
+    pub(crate) fn discovery_url(&self) -> Url {
+        self.iss.discovery_url()
     }
 }
 
@@ -654,29 +638,34 @@ impl AuthConfig {
             );
         }
 
-        let mut seen: Vec<&str> = Vec::new();
+        // Duplicate detection compares the claim text, which is
+        // `IssuerUrl`'s identity. Two entries for one `iss` mean two trust
+        // decisions about the same provider, and those can disagree — which is
+        // what this rule is for.
+        //
+        // Emptiness and a missing scheme are not checked here. `IssuerUrl`
+        // cannot hold either, so the constructors refuse both before an
+        // `Issuer` exists. The check moved to the line that writes the value,
+        // which is also the line whose argument a reader can still see.
+        let mut seen: Vec<&IssuerUrl> = Vec::new();
         for issuer in &self.issuers {
-            if issuer.iss.is_empty() {
-                problems.push("issuer is empty".to_owned());
-            }
-            if seen.contains(&issuer.iss.as_str()) {
+            if seen.contains(&&issuer.iss) {
                 problems.push(format!("issuer `{}` is listed twice", issuer.iss));
             }
-            seen.push(issuer.iss.as_str());
+            seen.push(&issuer.iss);
 
-            // The scheme gate lives here, not in `Issuer`'s constructors, so
-            // exactly one place decides whether cleartext is tolerable. That
-            // place is off unless a caller says otherwise, and even then it
-            // reaches loopback only.
-            match Url::parse(&issuer.iss) {
-                Ok(url) => {
-                    if let Some(problem) =
-                        self.cleartext_problem(&url, &format!("issuer `{}`", issuer.iss))
-                    {
-                        problems.push(problem);
-                    }
-                }
-                Err(_) => problems.push(format!("issuer `{}` is not a URL", issuer.iss)),
+            // The scheme gate lives here, not in `Issuer`'s constructors and not
+            // in `IssuerUrl`, so exactly one place decides whether cleartext is
+            // tolerable. That place is off unless a caller says otherwise, and
+            // even then it reaches loopback only.
+            //
+            // The URL comes off the value rather than being re-parsed from a
+            // string. It is the same parse the constructor did, kept instead of
+            // discarded.
+            if let Some(problem) =
+                self.cleartext_problem(issuer.iss.url(), &format!("issuer `{}`", issuer.iss))
+            {
+                problems.push(problem);
             }
 
             if let Some(keys) = &issuer.jwks_url
@@ -757,16 +746,13 @@ impl Default for AuthConfig {
 mod tests {
     use super::*;
 
-    /// The one function that both constructors funnel through rejects an empty
-    /// `iss`.
+    /// An empty `iss` is refused at the public constructors, not at boot.
     ///
-    /// Neither `discover` nor `with_jwks_url` can produce it, because each runs
-    /// `Url::parse(iss)` first and `""` does not parse. That is why this test
-    /// lives here rather than in `tests/`. Through the public surface, an empty
-    /// issuer is reported as a URL that would not parse. That sends an operator
-    /// to look for a typo in a string they left blank. The guard below is what
-    /// makes the diagnosis match the mistake, and it is exercised only by
-    /// coming at `new` from inside the module.
+    /// Both `discover` and `with_jwks_url` take `impl TryInto<IssuerUrl>`, so the
+    /// blank value is refused while the argument is still in view. This test
+    /// pins that the refusal reaches the caller unchanged, rather than being
+    /// swallowed or restated as a URL that would not parse — which would send
+    /// an operator looking for a typo in a string they left blank.
     ///
     /// The state is worth refusing rather than tolerating because an issuer
     /// keyed on `""` is not inert. It becomes a slot in the registry that no
@@ -775,22 +761,31 @@ mod tests {
     /// duplicate-issuer scan and in the count of configured issuers. So a
     /// deployment reads as "two issuers trusted" while one of them is
     /// unreachable by construction.
+    ///
+    /// The guard itself now lives in [`IssuerUrl::parse`], which is where the
+    /// blank value is first seen. What is left to check here is the plumbing:
+    /// that neither constructor has a path around it.
     #[test]
     fn an_empty_issuer_is_refused_at_the_choice_point() {
-        let url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
-
-        let err = Issuer::new(String::new(), url, None, ["api"])
-            .expect_err("an empty `iss` is not an issuer");
-
-        assert!(
-            matches!(err, AuthError::Configuration(_)),
-            "the operator set this, so it is theirs to fix: {err:?}"
-        );
-        assert!(
-            err.to_string().contains("issuer is empty"),
-            "say it is blank; 'would not parse as a URL' describes the symptom and \
-             sends them looking for a typo: {err}"
-        );
+        for err in [
+            Issuer::discover("", ["api"]).expect_err("an empty `iss` is not an issuer"),
+            Issuer::with_jwks_url(
+                "",
+                Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL"),
+                ["api"],
+            )
+            .expect_err("an empty `iss` is not an issuer"),
+        ] {
+            assert!(
+                matches!(err, AuthError::Configuration(_)),
+                "the operator set this, so it is theirs to fix: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("issuer is empty"),
+                "say it is blank; 'would not parse as a URL' describes the symptom and \
+                 sends them looking for a typo: {err}"
+            );
+        }
     }
 
     /// The empty audience set is refused where it is created, not at boot.
@@ -821,7 +816,7 @@ mod tests {
         );
 
         let literal = Issuer {
-            iss: "https://identity.example".to_owned(),
+            iss: IssuerUrl::parse("https://identity.example").expect("a URL"),
             jwks_url: None,
             audiences: Vec::new(),
             authorized_parties: Vec::new(),
@@ -836,40 +831,27 @@ mod tests {
         );
     }
 
-    /// `discovery_url` refuses to invent a location for an issuer that is not a
-    /// URL.
+    /// `discovery_url` cannot be reached with an issuer that is not a URL.
     ///
-    /// `AuthConfig::validate` parses `iss` too and reports `issuer `x` is not a
-    /// URL`, so an `Authenticator` built by `start` never reaches this line.
-    /// That is the same shadowing that hides the guard above, and the same
-    /// reason to pin it directly. `discovery_url` is `pub(crate)`, and the next
-    /// caller of it does not have to come through `start`. RFC 8414 §3.1
-    /// derives the discovery location by string surgery on `iss`. So a non-URL
-    /// `iss` that reached this function would yield a parse panic. Or, if the
-    /// scheme is permissive, a URL pointing somewhere the issuer does not live. A discovery document fetched from the wrong place is then a *trust*
-    /// problem, not a configuration one.
+    /// This used to be a runtime guard inside `discovery_url`, which took a
+    /// `Result` and reported `is not a URL` on the scheme-less case. The guard
+    /// is gone because the case is gone: `IssuerUrl` cannot hold a string that
+    /// did not parse, so a scheme-less issuer never becomes an `Issuer` at all.
     ///
-    /// The literal below is built *inside* this module, which is now the only
-    /// place an `Issuer` can be assembled field-by-field. `audiences` and
-    /// `authorized_parties` are private, so a host cannot write a literal at
-    /// all — one private field is enough to close struct-literal construction —
-    /// and cannot reach an `iss` that skipped `Url::parse`. That closes the
-    /// route this test used to exercise from outside.
+    /// The regression this pins is a *trust* one. RFC 8414 §3.1 derives the
+    /// discovery location by surgery on `iss`, and the document fetched from
+    /// there names the `jwks_uri` whose keys decide who authenticates. A
+    /// location derived from a half-written identifier would ask a server the
+    /// operator did not name. Derivation is now infallible precisely because
+    /// the input is a type that cannot be wrong.
     ///
-    /// It still pins `discovery_url`'s own guard, which matters for the same
-    /// reason as above: the function is `pub(crate)`, and the next caller of it
-    /// does not have to come through `start`.
+    /// The literal below is built *inside* this module, which is the only place
+    /// an `Issuer` can be assembled field-by-field. Every field is typed or
+    /// private, so even that route cannot produce a scheme-less `iss`: the only
+    /// way to obtain an `IssuerUrl` is [`IssuerUrl::parse`].
     #[test]
-    fn a_non_url_issuer_never_yields_a_discovery_location() {
-        let issuer = Issuer {
-            iss: "keycloak.example/realms/demo".to_owned(), // the scheme went missing
-            jwks_url: None,
-            audiences: vec!["api".to_owned()],
-            authorized_parties: Vec::new(),
-        };
-
-        let err = issuer
-            .discovery_url()
+    fn a_scheme_less_issuer_never_reaches_discovery() {
+        let err = Issuer::discover("keycloak.example/realms/demo", ["api"])
             .expect_err("a scheme-less issuer has no well-known location to derive");
 
         assert!(
