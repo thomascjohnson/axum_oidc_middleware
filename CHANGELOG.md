@@ -5,7 +5,7 @@ All notable changes to this crate are recorded here. The format follows
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Being
 pre-1.0, a breaking change moves the minor number: `0.1.x` to `0.2.0`.
 
-## Unreleased
+## 0.3.0 - 2026-11-18
 
 ### Fixed — one guard `0.3.0` said it had removed was still in the file
 
@@ -30,8 +30,6 @@ refusal of an `iss` that is not an absolute URL had no test at all, and it is
 the one behaviour change of 0.3.0 a reviewer had to take on trust; it is asserted
 through `authenticate`, including that the refused value stays out of the
 refusal. 220 tests, 100% of functions executed.
-
-## 0.3.0 - 2026-11-18
 
 ### Changed — identifiers are typed, and the parse happens once
 
