@@ -39,6 +39,7 @@ use crate::claims::Claims;
 use crate::config::{AuthConfig, Issuer, SignatureAlgorithm};
 use crate::error::AuthError;
 use crate::jwks::{CachePolicy, JwksRegistry};
+use crate::types::{Audience, AuthorizedParty, IssuerUrl};
 
 /// Verifies bearer tokens from one or more OIDC issuers.
 ///
@@ -72,9 +73,12 @@ struct Inner {
     /// it, so any trusted issuer could vouch for any audience the deployment
     /// served. The field must not be able to grow back into that by being
     /// reached for out of habit.
-    audiences_for_reporting: Vec<String>,
+    audiences_for_reporting: Vec<Audience>,
     /// Per-issuer audience sets, keyed by the exact `iss`, copied once here
     /// rather than walked per request.
+    ///
+    /// The key is [`IssuerUrl`], which hashes on the claim text, so a lookup
+    /// uses the verified `iss` as a borrow and needs no allocation.
     ///
     /// Two gates run on `aud`, and both must pass. The `Validation` behind
     /// [`FamilyValidations::for_key`] requires the union; this gate requires
@@ -85,10 +89,10 @@ struct Inner {
     /// Every entry comes straight from an `Issuer` that had to name at least
     /// one audience to exist. There is no ceiling to intersect with and no
     /// inherit branch: the answer for an issuer is the list on that issuer.
-    issuer_audiences: HashMap<String, Vec<String>>,
+    issuer_audiences: HashMap<IssuerUrl, Vec<Audience>>,
     /// Every `azp` named by any issuer, derived once, for the accessor.
     /// Reporting only — nothing here accepts a token, and the name says so.
-    authorized_parties_for_reporting: Vec<String>,
+    authorized_parties_for_reporting: Vec<AuthorizedParty>,
     /// Per-issuer `azp` sets, keyed by the exact `iss`. An entry is the set of
     /// clients accepted *from that issuer*, and the `azp` gate is off for an
     /// issuer whose entry is empty.
@@ -97,7 +101,7 @@ struct Inner {
     /// unique within a realm, not across realms. The reasoning, and the swap a
     /// shared list would allow, are on
     /// [`Issuer::authorized_parties()`](crate::Issuer::authorized_parties).
-    issuer_authorized_parties: HashMap<String, Vec<String>>,
+    issuer_authorized_parties: HashMap<IssuerUrl, Vec<AuthorizedParty>>,
 }
 
 impl Authenticator {
@@ -117,14 +121,14 @@ impl Authenticator {
         config.validate()?;
 
         let algorithm_names = config.algorithm_names();
-        let mut issuers: Vec<(String, Url)> = Vec::with_capacity(config.issuers.len());
+        let mut issuers: Vec<(IssuerUrl, Url)> = Vec::with_capacity(config.issuers.len());
 
         for issuer in &config.issuers {
             let jwks_url = match &issuer.jwks_url {
                 Some(url) => url.clone(),
                 None => discover(issuer, config.allow_insecure_http).await?,
             };
-            issuers.push((issuer.iss.clone(), jwks_url));
+            issuers.push((issuer.iss().clone(), jwks_url));
         }
 
         let registry = JwksRegistry::new(
@@ -159,15 +163,15 @@ impl Authenticator {
         // deployment-wide list: the `Issuer` is the only place either scope is
         // stated, and `validate` already refused an issuer that named no
         // audience.
-        let issuer_audiences: HashMap<String, Vec<String>> = config
+        let issuer_audiences: HashMap<IssuerUrl, Vec<Audience>> = config
             .issuers
             .iter()
-            .map(|issuer| (issuer.iss.clone(), issuer.audiences().to_vec()))
+            .map(|issuer| (issuer.iss().clone(), issuer.audiences().to_vec()))
             .collect();
-        let issuer_authorized_parties: HashMap<String, Vec<String>> = config
+        let issuer_authorized_parties: HashMap<IssuerUrl, Vec<AuthorizedParty>> = config
             .issuers
             .iter()
-            .map(|issuer| (issuer.iss.clone(), issuer.authorized_parties().to_vec()))
+            .map(|issuer| (issuer.iss().clone(), issuer.authorized_parties().to_vec()))
             .collect();
 
         Self {
@@ -184,7 +188,11 @@ impl Authenticator {
     }
 
     /// The issuers whose tokens this crate accepts.
-    pub fn issuers(&self) -> impl Iterator<Item = &str> {
+    ///
+    /// Each is an [`IssuerUrl`], so `as_str()` gives the exact claim text a
+    /// token must carry and `url()` gives the parsed form. There is no way to
+    /// get a `&str` that is not one of those two.
+    pub fn issuers(&self) -> impl Iterator<Item = &IssuerUrl> {
         self.inner.keys.issuers()
     }
 
@@ -201,13 +209,13 @@ impl Authenticator {
     /// checked against on its own. `the_reporting_unions_match_the_per_issuer_sets`
     /// pins the two to the same value. The `all_` prefix marks the width, so a
     /// caller cannot mistake it for the narrower answer beside it.
-    pub fn all_audiences(&self) -> &[String] {
+    pub fn all_audiences(&self) -> &[Audience] {
         &self.inner.audiences_for_reporting
     }
 
     /// The `aud` values a token from `iss` may name, or `None` when no such
     /// issuer is configured. This is the set the audience gate enforces.
-    pub fn issuer_audiences(&self, iss: &str) -> Option<&[String]> {
+    pub fn issuer_audiences(&self, iss: &IssuerUrl) -> Option<&[Audience]> {
         self.inner.issuer_audiences.get(iss).map(Vec::as_slice)
     }
 
@@ -218,14 +226,14 @@ impl Authenticator {
     /// from the issuer that named it, which is what
     /// [`Self::issuer_authorized_parties`] holds. This is the union of those
     /// per-issuer sets, not a set any gate consults.
-    pub fn all_authorized_parties(&self) -> &[String] {
+    pub fn all_authorized_parties(&self) -> &[AuthorizedParty] {
         &self.inner.authorized_parties_for_reporting
     }
 
     /// The `azp` values a token from `iss` may name, or `None` when no such
     /// issuer is configured. An empty slice means that issuer's `azp` gate is
     /// off, and it is off for that issuer alone.
-    pub fn issuer_authorized_parties(&self, iss: &str) -> Option<&[String]> {
+    pub fn issuer_authorized_parties(&self, iss: &IssuerUrl) -> Option<&[AuthorizedParty]> {
         self.inner
             .issuer_authorized_parties
             .get(iss)
@@ -303,8 +311,8 @@ impl Authenticator {
             return Ok(());
         }
 
-        match claims.azp.as_deref() {
-            Some(azp) if accepted.iter().any(|party| party == azp) => Ok(()),
+        match claims.azp.as_ref() {
+            Some(azp) if accepted.contains(azp) => Ok(()),
             // Distinguished in the message only. Both are the same refusal,
             // and `azp`-absent versus `azp`-unexpected is enough to tell a
             // misconfigured client scope apart from the wrong client. The
@@ -654,7 +662,7 @@ fn base_validation(config: &AuthConfig) -> Validation {
         &config
             .issuers
             .iter()
-            .map(|issuer| issuer.iss.as_str())
+            .map(|issuer| issuer.iss().as_str())
             .collect::<Vec<_>>(),
     );
     // The union of what the issuers asked for, so this gate is the wide one and
@@ -672,9 +680,26 @@ fn base_validation(config: &AuthConfig) -> Validation {
 /// decides the token's validity beyond which public keys to try. Returns
 /// `Ok(None)` when the payload is readable but has no string `iss`.
 ///
+/// # Why the value is parsed here
+///
+/// `jsonwebtoken::decode` deserialises the payload a second time, into its own
+/// private struct, and validates `iss` against *that* — not against the
+/// [`Claims`] this crate asks for. So typing `Claims::iss` does not type the
+/// library's gate.
+///
+/// What it does mean is that `Claims::iss` has a strict `Deserialize`. A
+/// malformed `iss` reaching that would surface as a serde failure inside
+/// `decode`, which `verify` renders as the generic `failed validation`. That
+/// would tell an operator less than the crate told them before.
+///
+/// Parsing the same string here, first, fixes that. A malformed `iss` is
+/// reported as a malformed `iss`. And because the identical string has already
+/// parsed, the later strict `Deserialize` cannot fail, so no diagnostic is
+/// lost and none is duplicated.
+///
 /// Owns its result. This call decodes the payload from a `Vec<u8>` it built,
 /// so a borrow from it would not outlive the call.
-fn claimed_issuer(token: &str) -> Result<Option<String>, AuthError> {
+fn claimed_issuer(token: &str) -> Result<Option<IssuerUrl>, AuthError> {
     #[derive(Deserialize)]
     struct IssuerOnly {
         iss: Option<String>,
@@ -687,7 +712,16 @@ fn claimed_issuer(token: &str) -> Result<Option<String>, AuthError> {
         .map_err(|err| AuthError::InvalidToken(format!("unreadable JWT payload: {err}")))?
         .iss;
 
-    Ok(issuer)
+    // The raw value is not echoed back. `iss` is attacker-controlled and can be
+    // arbitrarily long, and this message reaches both the `WWW-Authenticate`
+    // header and a log line. Naming the claim is enough to locate the problem;
+    // `aud_hint` documents what an unbounded value in this position costs.
+    match issuer {
+        Some(raw) => IssuerUrl::parse(&raw).map(Some).map_err(|_| {
+            AuthError::InvalidToken("token `iss` claim is not an absolute URL".to_owned())
+        }),
+        None => Ok(None),
+    }
 }
 
 /// Split a compact JWS into its three segments.
@@ -734,7 +768,7 @@ async fn discover(issuer: &Issuer, allow_http: bool) -> Result<Url, AuthError> {
         jwks_uri: Option<String>,
     }
 
-    let url = issuer.discovery_url()?;
+    let url = issuer.discovery_url();
     let client = crate::http::client(CachePolicy::default().timeout, allow_http);
 
     let document: Discovery = client
@@ -757,11 +791,11 @@ async fn discover(issuer: &Issuer, allow_http: bool) -> Result<Url, AuthError> {
     // Accepting it would silently trust a neighbour, which is exactly the
     // confusion a multi-tenant Keycloak makes easy.
     match document.issuer.as_deref() {
-        Some(found) if found == issuer.iss => {}
+        Some(found) if found == issuer.iss().as_str() => {}
         Some(found) => {
             return Err(AuthError::Configuration(format!(
                 "issuer `{iss}` reported itself as `{found}` in {url}",
-                iss = issuer.iss
+                iss = issuer.iss()
             )));
         }
         // `issuer` is REQUIRED by OIDC Discovery §3. Its absence is a bug or
@@ -804,14 +838,14 @@ async fn discover(issuer: &Issuer, allow_http: bool) -> Result<Url, AuthError> {
 /// Three, then the count. Three is enough to spot the `aud`-misconfigured class
 /// by eye. The count matters because "and 497 you are not shown" tells the
 /// operator where to look. One client, or the IdP's whole audience model.
-fn aud_hint(aud: &[String]) -> String {
+fn aud_hint(aud: &[Audience]) -> String {
     const SHOWN: usize = 3;
     // `take` rather than `join`: the whole point is to never build the long
     // string, so the bound has to be structural and not a trim afterwards.
     let shown = aud
         .iter()
         .take(SHOWN)
-        .cloned()
+        .map(Audience::as_str)
         .collect::<Vec<_>>()
         .join(", ");
     // `saturating_sub`, matched on zero — not `checked_sub` matched on `None`.
@@ -836,6 +870,20 @@ fn aud_hint(aud: &[String]) -> String {
 mod tests {
     use super::*;
 
+    /// An issuer for a test registry, built the only way one can be built.
+    fn issuer(url: &str) -> IssuerUrl {
+        IssuerUrl::parse(url).expect("a test issuer is a URL")
+    }
+
+    /// The configured clients as text, so an assertion compares strings and not
+    /// newtypes it had to build.
+    fn party_text(parties: &[AuthorizedParty]) -> Vec<String> {
+        parties
+            .iter()
+            .map(|party| party.as_str().to_owned())
+            .collect()
+    }
+
     /// The `SHOWN` boundary, where the count and the list stop agreeing.
     ///
     /// At exactly `SHOWN` audiences the hidden count is zero. A zero-count
@@ -853,8 +901,11 @@ mod tests {
     /// claiming a remainder.
     #[test]
     fn aud_hint_never_announces_a_remainder_of_zero() {
-        let list =
-            |n: usize| -> Vec<String> { (0..n).map(|k| format!("aud-{k}")).collect::<Vec<_>>() };
+        let list = |n: usize| -> Vec<Audience> {
+            (0..n)
+                .map(|k| Audience::new(format!("aud-{k}")).expect("an audience"))
+                .collect::<Vec<_>>()
+        };
 
         assert_eq!(aud_hint(&list(0)), "");
         assert_eq!(aud_hint(&list(1)), "aud-0");
@@ -1005,28 +1056,43 @@ mod tests {
     /// per-issuer sets would therefore be believed *because* nothing enforces
     /// it. So it is asserted to be exactly the deduplicated union of the sets
     /// the gates read, in issuer order.
+    ///
+    /// Three issuers, because the deduplication is the interesting half and it
+    /// needs a value that arrives twice and a value that arrives nowhere. One
+    /// client id is therefore named by two realms, which is the normal shape
+    /// across two Keycloak realms or two tenants, and one issuer gates on
+    /// nothing.
     #[test]
     fn the_reporting_unions_match_the_per_issuer_sets() {
         let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
         let other_url = Url::parse("https://other.example/jwks.json").expect("a JWKS URL");
+        let third_url = Url::parse("https://third.example/jwks.json").expect("a JWKS URL");
         let registry = JwksRegistry::new(
             [
-                ("https://issuer.example".to_owned(), jwks_url.clone()),
-                ("https://other.example".to_owned(), other_url.clone()),
+                (issuer("https://issuer.example"), jwks_url.clone()),
+                (issuer("https://other.example"), other_url.clone()),
+                (issuer("https://third.example"), third_url.clone()),
             ],
             &["RS256".to_owned()],
             CachePolicy::default(),
             false,
         )
-        .expect("two issuers, one algorithm");
+        .expect("three issuers, one algorithm");
 
-        // `billing` appears on both issuers on purpose: the union deduplicates.
+        // `billing` appears on two issuers and `client` appears on two issuers,
+        // both on purpose: the union deduplicates, and the audience side alone
+        // would leave the client side's dedup arm unexercised.
         let config = AuthConfig::empty().with_issuers([
             Issuer::with_jwks_url("https://issuer.example", jwks_url, ["api", "billing"])
                 .expect("an issuer")
-                .authorized_party("client"),
+                .authorized_party("client")
+                .expect("a named client"),
             Issuer::with_jwks_url("https://other.example", other_url, ["billing", "reports"])
                 .expect("an issuer"),
+            Issuer::with_jwks_url("https://third.example", third_url, ["api"])
+                .expect("an issuer")
+                .authorized_party("client")
+                .expect("the same client id, in another realm"),
         ]);
 
         let auth = Authenticator::from_registry(registry, &config);
@@ -1039,7 +1105,8 @@ mod tests {
         assert_eq!(
             auth.all_authorized_parties().to_vec(),
             vec!["client"],
-            "the second issuer gates on nothing, so it adds nothing here"
+            "one client id named by two realms is listed once, and the issuer that \
+             gates on nothing adds nothing"
         );
 
         // The accessor a host reads to see what an issuer gates on, in its three
@@ -1049,20 +1116,20 @@ mod tests {
         // treats as drift, so reading it as "no gate" would read the one value
         // that means "this config no longer matches its keys".
         assert_eq!(
-            auth.issuer_authorized_parties("https://issuer.example")
-                .map(<[String]>::to_vec),
+            auth.issuer_authorized_parties(&issuer("https://issuer.example"))
+                .map(party_text),
             Some(vec!["client".to_owned()]),
             "the gating issuer reports the client it named"
         );
         assert_eq!(
-            auth.issuer_authorized_parties("https://other.example")
-                .map(<[String]>::to_vec),
+            auth.issuer_authorized_parties(&issuer("https://other.example"))
+                .map(party_text),
             Some(Vec::new()),
             "the ungated issuer has an entry, and it is empty"
         );
         assert_eq!(
-            auth.issuer_authorized_parties("https://unconfigured.example")
-                .map(<[String]>::to_vec),
+            auth.issuer_authorized_parties(&issuer("https://unconfigured.example"))
+                .map(party_text),
             None,
             "an issuer that is not configured has no entry at all"
         );
@@ -1070,10 +1137,15 @@ mod tests {
         // The same answer, recomputed from the maps the gates actually read.
         // This is the assertion that would fail if a future edit updated one
         // copy and not the other.
-        let mut derived: Vec<String> = Vec::new();
-        for iss in ["https://issuer.example", "https://other.example"] {
+        let mut derived: Vec<Audience> = Vec::new();
+        for iss in [
+            "https://issuer.example",
+            "https://other.example",
+            "https://third.example",
+        ] {
+            let iss = IssuerUrl::parse(iss).expect("a test issuer is a URL");
             for aud in auth
-                .issuer_audiences(iss)
+                .issuer_audiences(&iss)
                 .expect("every configured issuer has an entry")
             {
                 if !derived.contains(aud) {
@@ -1090,10 +1162,14 @@ mod tests {
         // And the same for the client sets. `azp` had no such check: the union
         // was asserted on its own above, and nothing compared it with what the
         // gate actually looks up per issuer.
-        let mut derived_parties: Vec<String> = Vec::new();
-        for iss in ["https://issuer.example", "https://other.example"] {
+        let mut derived_parties: Vec<AuthorizedParty> = Vec::new();
+        for iss in [
+            "https://issuer.example",
+            "https://other.example",
+            "https://third.example",
+        ] {
             for client in auth
-                .issuer_authorized_parties(iss)
+                .issuer_authorized_parties(&issuer(iss))
                 .expect("every configured issuer has an entry")
             {
                 if !derived_parties.contains(client) {
@@ -1120,7 +1196,7 @@ mod tests {
     fn an_issuer_with_no_authorised_party_entry_refuses_rather_than_accepting() {
         let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
         let registry = JwksRegistry::new(
-            [("https://issuer.example".to_owned(), jwks_url.clone())],
+            [(issuer("https://issuer.example"), jwks_url.clone())],
             &["RS256".to_owned()],
             CachePolicy::default(),
             false,
@@ -1179,7 +1255,7 @@ mod tests {
     fn an_issuer_with_no_audience_layer_refuses_rather_than_accepting() {
         let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
         let registry = JwksRegistry::new(
-            [("https://issuer.example".to_owned(), jwks_url.clone())],
+            [(issuer("https://issuer.example"), jwks_url.clone())],
             &["RS256".to_owned()],
             CachePolicy::default(),
             false,
@@ -1268,6 +1344,100 @@ mod tests {
         }
     }
 
+    /// `claimed_issuer` parses the token for itself and reports its own reason.
+    ///
+    /// Unreachable through `authenticate`, which runs `decode_header` first and
+    /// refuses these shapes there — the same reason
+    /// [`a_signature_from_an_untrusted_issuer_is_named_as_an_issuer_problem`]
+    /// calls `verify` directly. The contract worth pinning is the one the
+    /// pre-parse depends on: `claimed_issuer` splits and decodes on its own
+    /// authority, so it stays correct if a future caller reaches it before any
+    /// header check, or if `decode_header` loosens. A helper that assumed its
+    /// caller had already validated the shape would panic on `"a.b"` the day
+    /// that stopped being true.
+    ///
+    /// [`a_signature_from_an_untrusted_issuer_is_named_as_an_issuer_problem`]: Self::a_signature_from_an_untrusted_issuer_is_named_as_an_issuer_problem
+    #[test]
+    fn claimed_issuer_refuses_a_token_shape_it_cannot_read() {
+        // Too few segments to be a compact JWS at all.
+        assert_eq!(
+            claimed_issuer("a.b"),
+            Err(AuthError::InvalidToken(
+                "not a compact JWS: expected three dot-separated parts".to_owned()
+            )),
+            "the shape refusal is the one thing a caller can act on"
+        );
+
+        // Three segments, and the payload is not base64url.
+        let err = claimed_issuer("aaa.@@@.bbb").expect_err("`@@@` is not base64url");
+        assert!(
+            matches!(err, AuthError::InvalidToken(_))
+                && err.to_string().contains("invalid base64url segment"),
+            "say which segment could not be read, not that the token is forged: {err:?}"
+        );
+    }
+
+    /// A well-formed `iss` comes back parsed, and a malformed one is refused
+    /// with a message that names the claim.
+    ///
+    /// This is the seam the typed-identifier design turned a `String` into an
+    /// `IssuerUrl` at, and the reason the pre-parse exists at all:
+    /// `Claims::iss` has a strict `Deserialize`, so a malformed `iss` that
+    /// reached `jsonwebtoken::decode` would surface as a serde failure, which
+    /// `verify` renders as the generic `failed validation`. Parsing the same
+    /// string here, first, is what keeps the specific message. Pinned as the
+    /// exact text because the wording is the whole product.
+    #[test]
+    fn claimed_issuer_returns_a_parsed_issuer_and_names_a_malformed_one() {
+        use base64::Engine as _;
+
+        let encode = |claims: serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&claims).expect("serialise a payload"))
+        };
+        let token = |claims: serde_json::Value| format!("e30.{}.c2ln", encode(claims));
+
+        assert_eq!(
+            claimed_issuer(&token(
+                serde_json::json!({ "iss": "https://identity.example" })
+            ))
+            .expect("an absolute URL parses"),
+            Some(IssuerUrl::parse("https://identity.example").expect("a URL")),
+            "the claim text is what comes back, not a normalised form"
+        );
+
+        // No `iss` at all is `Ok(None)`: the caller decides that a token naming
+        // nobody cannot be routed, and says so in its own words.
+        assert_eq!(
+            claimed_issuer(&token(serde_json::json!({ "sub": "user-1" }))),
+            Ok(None)
+        );
+
+        // Present, but not an absolute URL.
+        let junk = "keycloak.example/realms/demo";
+        let err = claimed_issuer(&token(serde_json::json!({ "iss": junk })))
+            .expect_err("a scheme-less `iss` selects no trust bundle");
+        assert!(
+            matches!(err, AuthError::InvalidToken(_))
+                && err
+                    .to_string()
+                    .contains("token `iss` claim is not an absolute URL"),
+            "name the claim, not the parser: {err:?}"
+        );
+
+        // The value itself stays out of the message. It is attacker-controlled,
+        // arbitrarily long, and this text reaches both a log line and the
+        // `WWW-Authenticate` header. `aud_hint` documents the same bound.
+        let long = format!("{}{}", "n0t-a-url ", "x".repeat(4_000));
+        let echoed = claimed_issuer(&token(serde_json::json!({ "iss": long })))
+            .expect_err("still not a URL");
+        assert!(
+            !echoed.to_string().contains('x'),
+            "the refusal must not carry the value it refused: {} bytes returned",
+            echoed.to_string().len()
+        );
+    }
+
     /// The crate refuses a signature that verifies, from an issuer nobody
     /// configured, for the reason that is actually true.
     ///
@@ -1310,7 +1480,7 @@ mod tests {
 
         let jwks_url = Url::parse("https://issuer.example/jwks.json").expect("a JWKS URL");
         let registry = JwksRegistry::new(
-            [("https://issuer.example".to_owned(), jwks_url.clone())],
+            [(issuer("https://issuer.example"), jwks_url.clone())],
             &["RS256".to_owned()],
             CachePolicy::default(),
             false,

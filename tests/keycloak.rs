@@ -13,7 +13,9 @@ mod common;
 
 use std::time::Duration;
 
-use axum_oidc_middleware::{AuthConfig, AuthError, Authenticator, CachePolicy, Issuer};
+use axum_oidc_middleware::{
+    AuthConfig, AuthError, Authenticator, AuthorizedParty, CachePolicy, Issuer,
+};
 use common::{StubIssuer, TestKey};
 
 const API_AUDIENCE: &str = "myaudience";
@@ -37,7 +39,8 @@ async fn verifier(
     let issuer = Issuer::discover(stub.iss(), audiences.iter().copied()).expect("valid issuer");
     let issuer = authorized_parties
         .iter()
-        .fold(issuer, |issuer, party| issuer.authorized_party(*party));
+        .try_fold(issuer, |issuer, party| issuer.authorized_party(*party))
+        .expect("every named client is a client");
 
     let config = AuthConfig::empty()
         .with_issuer(issuer)
@@ -132,7 +135,10 @@ async fn audience_account_plus_azp_admits_the_right_client() {
         .expect("the configured client is admitted");
 
     assert_eq!(claims.sub, "kc-user-1");
-    assert_eq!(claims.azp.as_deref(), Some(CLIENT));
+    assert_eq!(
+        claims.azp.as_ref().map(AuthorizedParty::as_str),
+        Some(CLIENT)
+    );
     assert_eq!(claims.aud, vec![KEYCLOAK_DEFAULT_AUD]);
 }
 
@@ -283,20 +289,21 @@ async fn azp_does_not_weaken_the_issuer_check() {
 
 #[tokio::test]
 async fn an_empty_authorised_party_is_a_configuration_error() {
-    let bad = AuthConfig::empty().with_issuer(
-        Issuer::discover("https://identity.example", [API_AUDIENCE])
-            .expect("valid issuer")
-            // `--azp ""` would be a check that can never pass: an outage dressed
-            // up as a security control, and quiet about it.
-            .authorized_party(String::new()),
-    );
+    let err = Issuer::discover("https://identity.example", [API_AUDIENCE])
+        .expect("valid issuer")
+        // `--azp ""` would be a check that can never pass: an outage dressed
+        // up as a security control, and quiet about it.
+        //
+        // This used to be caught at boot, by `validate`. It is now refused on
+        // the line that wrote the value: `AuthorizedParty::new` will not build a
+        // blank one, and `authorized_party` is the only way in.
+        .authorized_party(String::new())
+        .expect_err("an empty azp is not a client");
 
+    assert!(matches!(err, AuthError::Configuration(_)), "{err:?}");
     assert!(
-        matches!(
-            bad.validate(),
-            Err(AuthError::Configuration(reason)) if reason.contains("azp")
-        ),
-        "an empty azp must be rejected at startup"
+        err.to_string().contains("azp"),
+        "the refusal should name the claim the operator wrote: {err}"
     );
 
     // And an empty *list* means "not configured", which is valid. The test

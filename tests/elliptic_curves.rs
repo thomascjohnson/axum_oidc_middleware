@@ -149,7 +149,7 @@ async fn an_es256_token_authenticates_when_es256_is_accepted() {
         .expect("a P-256 JWK verifies an ES256 token");
 
     assert_eq!(claims.sub, "user-123");
-    assert_eq!(claims.iss, h.iss);
+    assert_eq!(claims.iss.as_str(), h.iss);
 }
 
 #[tokio::test]
@@ -551,7 +551,7 @@ async fn a_realm_publishing_both_key_types_verifies_both_token_types() {
     // Both still named the audience they had to name. Narrowing the algorithm
     // list per key must not have taken the rest of the rules with it.
     for claims in [rsa_claims, ec_claims] {
-        assert_eq!(claims.iss, h.iss);
+        assert_eq!(claims.iss.as_str(), h.iss);
     }
     let wrong_audience = h
         .auth

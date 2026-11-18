@@ -243,6 +243,16 @@ run = "cargo publish --locked"
 # which `rust-toolchain.toml` already asks for. CI installs the binary with an
 # action. Do not declare the tool here: `mise install` would then build it
 # from source on every fresh runner.
+#
+# Read the summary with one caveat, before someone spends an afternoon on it.
+# A `tracing` macro evaluates its arguments only when a subscriber enables that
+# level, and LLVM never attributes a count to the region those arguments occupy:
+# it reports zero however often the event fires. Every such region in `src/` is
+# zero, including the ones `tests/observability.rs` proves fire by asserting on
+# the captured fields. So the handful of zero regions that survive a green suite
+# are the instrument's ceiling, not a gap in the tests, and region coverage
+# cannot reach 100% here. Function coverage is the number that means something:
+# it says a path has an assertion behind it, and it is 100%.
 
 [tasks.coverage]
 description = "Summarize test coverage"

@@ -46,7 +46,9 @@ mod common;
 
 use std::time::Duration;
 
-use axum_oidc_middleware::{AuthConfig, AuthError, Authenticator, CachePolicy, Issuer};
+use axum_oidc_middleware::{
+    AuthConfig, AuthError, Authenticator, AuthorizedParty, CachePolicy, Issuer,
+};
 use common::{StubIssuer, TestKey};
 
 /// What issuer A is trusted for.
@@ -166,7 +168,8 @@ fn issuer_scope(iss: &str, audiences: &[&str], parties: &[&str]) -> Issuer {
     let issuer = Issuer::discover(iss, audiences.iter().copied()).expect("valid issuer");
     parties
         .iter()
-        .fold(issuer, |issuer, party| issuer.authorized_party(*party))
+        .try_fold(issuer, |issuer, party| issuer.authorized_party(*party))
+        .expect("every named client is a client")
 }
 
 /// Claims for `iss`/`aud`, with `azp` present only when `party` names one.
@@ -397,8 +400,16 @@ async fn both_issuers_are_verified_by_their_own_keys_at_the_same_time() {
         .await
         .expect("issuer B authenticates against its own key, in the same process");
 
-    assert_eq!(from_a.iss, h.iss_a, "A's verified claims carry A's issuer");
-    assert_eq!(from_b.iss, h.iss_b, "B's verified claims carry B's issuer");
+    assert_eq!(
+        from_a.iss.as_str(),
+        h.iss_a,
+        "A's verified claims carry A's issuer"
+    );
+    assert_eq!(
+        from_b.iss.as_str(),
+        h.iss_b,
+        "B's verified claims carry B's issuer"
+    );
     assert_ne!(from_a.iss, from_b.iss, "and they are different issuers");
     assert_eq!(from_a.sub, "user-123", "A's subject survives the verifier");
     assert_eq!(from_b.sub, "user-123", "and so does B's");
@@ -582,7 +593,7 @@ async fn a_token_without_azp_is_accepted_while_azp_is_unconfigured() {
         .await
         .expect("an unconfigured `azp` admits any client");
     assert_eq!(
-        verified.azp.as_deref(),
+        verified.azp.as_ref().map(AuthorizedParty::as_str),
         Some(OTHER_CLIENT),
         "the claim survives into the verified claims even when it is not enforced"
     );
@@ -614,24 +625,20 @@ fn an_issuer_that_names_no_audiences_is_refused_and_says_which() {
 }
 
 #[tokio::test]
-async fn an_issuer_naming_a_blank_authorised_party_refuses_to_boot_and_says_which() {
+async fn an_issuer_naming_a_blank_authorised_party_is_refused_where_it_is_named() {
     // A blank `azp` could never match a token, so it is an outage dressed as a
-    // security control. It is refused at boot, naming the audience the gate
-    // sits beside and the issuer that named the blank — the issuer is the one
-    // to fix, since the gate belongs to it and not to the deployment.
-    let config = AuthConfig::empty()
-        .with_issuer(
-            Issuer::discover("https://identity.example/realms/a", [AUD_A]).expect("valid issuer"),
-        )
-        .with_issuer(
-            Issuer::discover("https://identity.example/realms/b", [AUD_B])
-                .expect("valid issuer")
-                .authorized_party(""),
-        );
+    // security control. It used to be refused at boot, from `validate`, with a
+    // message naming the issuer whose gate it was.
+    //
+    // It is now refused at the call that names it, because `AuthorizedParty`
+    // will not hold a blank entry. That is strictly more local: the operator
+    // reads the error beside the argument they can still see, and the value
+    // never reaches a config that looks settled.
+    let err = Issuer::discover("https://identity.example/realms/b", [AUD_B])
+        .expect("valid issuer")
+        .authorized_party("")
+        .expect_err("a gate that can never open is not a client");
 
-    let err = Authenticator::start(config)
-        .await
-        .expect_err("a gate that can never open is not bootable");
     assert!(matches!(err, AuthError::Configuration(_)), "{err:?}");
 
     let reason = err.to_string();
@@ -639,14 +646,16 @@ async fn an_issuer_naming_a_blank_authorised_party_refuses_to_boot_and_says_whic
         reason.contains("azp"),
         "the message must name the claim at fault: {reason}"
     );
-    assert!(
-        reason.contains("realms/b"),
-        "and the issuer that named the blank entry: {reason}"
-    );
-    assert!(
-        !reason.contains("realms/a"),
-        "issuer A is configured correctly and must not be reported: {reason}"
-    );
+
+    // The blank is per entry, so a set with one good client and one blank is
+    // refused too — the gate is not saved by the good entry.
+    let err = Issuer::discover("https://identity.example/realms/b", [AUD_B])
+        .expect("valid issuer")
+        .authorized_party(CLIENT)
+        .expect("a named client")
+        .authorized_party("")
+        .expect_err("one blank entry is enough");
+    assert!(err.to_string().contains("azp"), "{err}");
 }
 
 // ── What still works unchanged: a deployment with one issuer. ──────────────
@@ -679,7 +688,7 @@ async fn a_lone_issuer_naming_its_own_audience_boots_and_authenticates() {
         .await
         .expect("and authenticate the tokens it authenticates today");
     assert_eq!(claims.sub, "user-123");
-    assert_eq!(claims.iss, iss);
+    assert_eq!(claims.iss.as_str(), iss);
 
     // Naming one audience means naming only that one. An audience this issuer
     // never claimed was never in scope.
@@ -702,7 +711,8 @@ fn each_issuer_sees_its_own_scope_and_the_deployment_sees_the_union() {
         .with_issuer(
             Issuer::discover("https://identity.example", [AUD_A])
                 .expect("valid issuer")
-                .authorized_party(CLIENT),
+                .authorized_party(CLIENT)
+                .expect("a named client"),
         )
         .with_issuer(
             Issuer::discover("https://other.example", [AUD_B, AUD_A]).expect("valid issuer"),

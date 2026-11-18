@@ -5,6 +5,118 @@ All notable changes to this crate are recorded here. The format follows
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Being
 pre-1.0, a breaking change moves the minor number: `0.1.x` to `0.2.0`.
 
+## Unreleased
+
+### Fixed — one guard `0.3.0` said it had removed was still in the file
+
+`AuthConfig::validate` still carried a check for an issuer configured with a
+blank audience, one statement below the comment that says that check is gone.
+It could not fire: `Audience::new` refuses a blank entry, it is the only
+constructor a caller can reach, and `Issuer::audiences` is private. The entry
+above said the same thing. The check is removed, so the code, the comment, and
+that 0.3.0 entry now agree. No configuration that was accepted is refused, and
+none that was refused is accepted.
+
+### Tests — back to every function executed
+
+The typed identifiers added functions the suite never called: `IssuerUrl`'s
+`Debug`, `Serialize`, and `Borrow<str>`, and the `AsRef<str>`, `Hash`,
+`PartialEq<str>`, and `TryFrom<&String>` impls of `Audience` and
+`AuthorizedParty`. Each now has a test that states the property it exists for —
+that a map keyed by `IssuerUrl` answers the claim text a token carried, that a
+`Claims` value re-serialises to that text and not to the normalised URL, that a
+`&String` read out of a config file builds an audience. `claimed_issuer`'s
+refusal of an `iss` that is not an absolute URL had no test at all, and it is
+the one behaviour change of 0.3.0 a reviewer had to take on trust; it is asserted
+through `authenticate`, including that the refused value stays out of the
+refusal. 220 tests, 100% of functions executed.
+
+## 0.3.0 - 2026-11-18
+
+### Changed — identifiers are typed, and the parse happens once
+
+The three values this crate makes decisions on — the issuer, an audience, and an
+authorised party — were `String`s. Two consequences followed. An issuer had to be
+an absolute URL with no query or fragment, but that rule lived in
+`AuthConfig::validate` and the string was re-parsed at four sites, two of which
+threw the parsed `Url` away. And `iss` was a **public** `String` field, so a
+caller could overwrite it with a value no constructor ever saw; a test existed to
+pin that `validate` re-checked because it could not trust the field.
+
+Three new types replace those strings. `IssuerUrl`, `Audience`, and
+`AuthorizedParty` are all re-exported from the crate root:
+
+- `IssuerUrl` carries the exact `iss` claim text **and** its parsed `Url`. Both
+  are needed. `iss` is compared byte for byte, and a URL parser normalises:
+  `https://accounts.google.com` parses to a form with a trailing slash. Identity
+  is the claim text, so the normalised form is used only to derive the discovery
+  location. Empty, scheme-less, and query-or-fragment forms are refused by
+  `IssuerUrl::parse`. Whether cleartext is tolerable stays in `validate`, which
+  is a deployment-wide decision and unchanged.
+- `Audience` and `AuthorizedParty` are distinct types, not two `Vec<String>`.
+  The `aud` and `azp` gates can no longer be handed each other's list.
+- `Claims::iss`, `Claims::aud`, and `Claims::azp` are typed too. The JSON wire
+  shape is unchanged, so a host that logs or forwards a `Claims` value sees no
+  difference.
+
+Because the invariants are in the types, `AuthConfig::validate` no longer checks
+for an empty issuer, a scheme-less issuer, a blank audience, or a blank `azp`.
+None of those values can be constructed, inside the crate or outside it, so the
+checks were dead code wearing the look of a safeguard. `validate` still owns the
+https/loopback policy, the duplicate-issuer scan, an empty audience *set*, the
+algorithm set, leeway, and the cache policy timings.
+
+### Changed — API surface
+
+- `Issuer::iss` (a public `String` field) is removed. Use `Issuer::iss()`, which
+  returns `&IssuerUrl`. There is no setter: `iss` is settled when the issuer is
+  built.
+- `Issuer::discover` and `Issuer::with_jwks_url` take
+  `impl TryInto<IssuerUrl>` and `impl TryInto<Audience>`. A `&str` or `String`
+  argument still works, so a call site with a valid issuer and audience is
+  unchanged.
+- `Issuer::authorized_party` now returns `Result<Issuer, AuthError>`, because a
+  blank client id is refused rather than stored. **This is the one place a valid
+  call site gains a character:** the builder chain now needs a `?`.
+- `Issuer::audiences()` returns `&[Audience]`, and
+  `Issuer::authorized_parties()` returns `&[AuthorizedParty]`.
+- `AuthConfig::all_audiences()` returns `Vec<Audience>` and
+  `AuthConfig::all_authorized_parties()` returns `Vec<AuthorizedParty>`.
+- `Authenticator::issuers()` yields `&IssuerUrl` rather than `&str`.
+  `Authenticator::all_audiences()` returns `&[Audience]`, and
+  `Authenticator::all_authorized_parties()` returns `&[AuthorizedParty]`.
+  `issuer_audiences` and `issuer_authorized_parties` take `&IssuerUrl`.
+- `Claims::iss` is an `IssuerUrl`, `Claims::aud` is a `Vec<Audience>`, and
+  `Claims::azp` is an `Option<AuthorizedParty>`.
+
+`Issuer::discovery_url` became infallible internally: its input is a type that
+cannot be a non-URL. The public signature did not change; the method is
+`pub(crate)`.
+
+### Migration
+
+```rust
+// Still compiles, because the argument positions accept `&str`.
+let issuer = Issuer::discover("https://accounts.google.com", ["my-api"])?;
+
+// One `?` is new, and only for the builder that names a client.
+let issuer = Issuer::discover("https://sso.example.com/realms/app", ["my-api"])?
+    .authorized_party("my-client")?;
+
+// Reading values back changes shape.
+let exact = issuer.iss().as_str();            // was `issuer.iss`
+for audience in issuer.audiences() {
+    println!("{}", audience.as_str());        // was `&String`
+}
+
+// No longer compiles, by design: the field cannot be written.
+// issuer.iss = "identity.example".to_owned();
+```
+
+A blank audience or a blank `azp` that used to fail at boot now fails on the
+line that writes it. Both messages say which setting is blank, so the fix is the
+same; only the moment it is reported has moved.
+
 ## 0.2.0 - 2026-11-17
 
 ### Changed — audience and `azp` scope are now per issuer, and audience scope is

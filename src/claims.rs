@@ -10,6 +10,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::types::{Audience, AuthorizedParty, IssuerUrl};
+
 /// Claims from a token that passed signature verification **and** the
 /// issuer/audience/expiry gates in [`Authenticator::authenticate`](crate::Authenticator::authenticate).
 ///
@@ -24,13 +26,26 @@ pub struct Claims {
     /// `iss` — the issuer. The crate compares it with the trusted issuer whose
     /// key verified the signature. It rejects a token whose `iss` did not
     /// verify, before it builds this value.
-    pub iss: String,
+    ///
+    /// Typed, so an unparseable `iss` cannot be carried here: a value of this
+    /// type always parsed as an absolute URL. That is *shape*, not trust. It
+    /// becomes a trusted identifier only because
+    /// [`Authenticator::authenticate`](crate::Authenticator::authenticate)
+    /// matched it against a configured issuer and that issuer's key verified the
+    /// signature.
+    pub iss: IssuerUrl,
 
     /// `aud` — audiences. RFC 9068 §2.2.1 requires a list, but Google's ID
     /// tokens carry a single string, so this accepts both forms. At least one
     /// element must have matched a configured audience.
+    ///
+    /// Each entry is an [`Audience`], so an `aud` value cannot be handed to the
+    /// `azp` gate or compared against
+    /// [`Issuer::authorized_parties()`](crate::Issuer::authorized_parties) by
+    /// mistake. The entries are what the issuer asserted, not a trust decision:
+    /// the audience gate decides, and it runs after the signature.
     #[serde(deserialize_with = "deserialize_audience")]
-    pub aud: Vec<String>,
+    pub aud: Vec<Audience>,
 
     /// `exp` — expiry, seconds since the Unix epoch. Required. The crate
     /// rejects a token without it.
@@ -58,7 +73,7 @@ pub struct Claims {
     /// has already passed. When an issuer leaves it unset, the crate exposes the
     /// claim and enforces nothing.
     #[serde(default)]
-    pub azp: Option<String>,
+    pub azp: Option<AuthorizedParty>,
 
     /// `email` — convenience for the common "who is the human" question.
     ///
@@ -115,24 +130,31 @@ impl Claims {
 ///
 /// A token with no audience says who it is *not* for. That is the one thing
 /// this API depends on, so an empty list is a rejection rather than a pass.
-fn deserialize_audience<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+fn deserialize_audience<'de, D>(deserializer: D) -> Result<Vec<Audience>, D::Error>
 where
     D: Deserializer<'de>,
 {
+    // Named apart from [`Audience`] on purpose: this is the *shape* the claim
+    // arrived in, not a claim value. One variant holds the one-element list
+    // Google sends as a bare string.
     #[derive(Deserialize)]
     #[serde(untagged)]
-    enum Audience {
+    enum AudienceShape {
         One(String),
         Many(Vec<String>),
     }
 
-    let aud = match Audience::deserialize(deserializer)? {
-        Audience::One(one) => vec![one],
-        Audience::Many(many) => many,
+    let aud = match AudienceShape::deserialize(deserializer)? {
+        AudienceShape::One(one) => vec![one],
+        AudienceShape::Many(many) => many,
     };
 
     if aud.is_empty() {
         return Err(serde::de::Error::custom("`aud` must not be empty"));
     }
-    Ok(aud)
+    // A blank entry is *not* refused here. It cannot match any configured
+    // audience, so the gate rejects the token and names what it saw. Refusing
+    // it at deserialisation would replace that message with a serde failure and
+    // tell an operator less about a token they already have in hand.
+    Ok(aud.into_iter().map(Audience::from_wire).collect())
 }

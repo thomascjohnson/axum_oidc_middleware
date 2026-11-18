@@ -127,7 +127,7 @@ async fn an_issuer_at_a_path_is_discovered_at_that_path() {
         .authenticate(&claims)
         .await
         .expect("the realm's own token authenticates");
-    assert_eq!(verified.iss, stub.iss());
+    assert_eq!(verified.iss.as_str(), stub.iss());
     assert_eq!(verified.sub, "user-123");
 }
 
@@ -203,31 +203,26 @@ fn an_issuer_cannot_be_assembled_around_its_constructors() {
 
 /// The one route the private audience list did **not** close.
 ///
-/// A literal cannot be written from outside the crate, but `iss` is still `pub`,
-/// so a caller can assign a value the constructors never parsed:
+/// 0.2.0 let a caller assign `issuer.iss = "identity.example".to_owned()`, which
+/// left `validate` to notice the missing scheme at boot. That route is gone: the
+/// field is private and typed, and the only way to obtain its type is
+/// [`IssuerUrl::parse`], which refuses both a missing scheme and an empty
+/// string. This test pins what replaced it — the value a constructor accepted is
+/// what `iss()` returns, and there is no setter beside it to change that later.
 ///
-/// ```ignore
-/// let mut issuer = Issuer::discover(URL, ["my-api"])?;
-/// issuer.iss = "identity.example".to_owned(); // skips `Url::parse`
-/// ```
-///
-/// That leaves `validate` — not the constructor — as the last gate for a
-/// mutated value, which is why it re-checks rather than trusting where the
-/// value came from. This test exists because the shape above argues the route is
-/// gone, and a claim like that needs a test standing behind it.
+/// The text is compared byte for byte, so a trailing slash still makes a
+/// different issuer. That is the property a host's tokens depend on.
 #[test]
-fn validate_still_rechecks_an_issuer_mutated_after_construction() {
-    let mut unparseable = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
-    unparseable.iss = "identity.example".to_owned(); // the scheme went missing
-    let err = problem(&AuthConfig::empty().with_issuer(unparseable));
-    assert!(err.contains("is not a URL"), "{err}");
+fn the_issuer_text_is_settled_by_the_constructor() {
+    let issuer = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
+    assert_eq!(issuer.iss().as_str(), URL);
 
-    let mut empty = Issuer::discover(URL, [AUDIENCE]).expect("valid issuer");
-    empty.iss = String::new();
-    let err = problem(&AuthConfig::empty().with_issuer(empty));
-    assert!(
-        err.contains("issuer is empty"),
-        "an emptied issuer should be named as such: {err}"
+    let slashed = Issuer::discover(format!("{URL}/"), [AUDIENCE]).expect("valid issuer");
+    assert_eq!(slashed.iss().as_str(), format!("{URL}/"));
+    assert_ne!(
+        issuer.iss(),
+        slashed.iss(),
+        "a trailing slash is a different issuer, and the type must not merge them"
     );
 }
 
@@ -423,15 +418,25 @@ fn loopback_config() -> AuthConfig {
 }
 
 #[test]
-fn an_issuer_configured_with_an_empty_audience_is_refused() {
+fn an_issuer_with_blank_audience_is_refused_where_it_was_written() {
     // `Issuer::discover(URL, [""])` names a blank audience. No token ever
     // carries one, so every caller of that issuer is locked out by a setting
     // that reads as though it permitted something.
-    let err = problem(&config().with_issuer(Issuer::discover(URL, [""]).expect("valid issuer")));
+    //
+    // The refusal used to arrive at boot, from `validate`. It now arrives on the
+    // line that wrote the value, because `Audience::new` refuses blank and the
+    // constructor is the only way to name one. That is the improvement: the
+    // argument is still in view where the error is read.
+    let err = Issuer::discover(URL, [""]).expect_err("a blank audience is not an audience");
     assert!(
-        err.contains("configured with an empty audience") && err.contains(URL),
-        "the refusal should name the issuer whose audience is blank: {err}"
+        err.to_string().contains("audience is empty"),
+        "the refusal should say the audience is blank: {err}"
     );
+
+    // And the same for the second audience in a set, so the check is per entry
+    // rather than per list.
+    let err = Issuer::discover(URL, [AUDIENCE, ""]).expect_err("one blank entry is enough");
+    assert!(err.to_string().contains("audience is empty"), "{err}");
 }
 
 /// Every problem is reported at once, rather than the first one found.
@@ -441,34 +446,86 @@ fn an_issuer_configured_with_an_empty_audience_is_refused() {
 /// cycle is an outage window.
 #[test]
 fn validate_reports_every_problem_at_once() {
-    let err = problem(
-        &AuthConfig::empty()
-            .with_issuer(
-                Issuer::discover("http://identity.example", [AUDIENCE]).expect("valid issuer"),
-            )
-            .with_algorithms([])
-            // One issuer, two problems: the audience it named is blank, and so
-            // is the client it named. An empty *set* would be a third, but the
-            // constructor refuses that one before `validate` ever sees it, so
-            // this is the audience problem `validate` still owns.
-            .with_issuer(
-                Issuer::discover(URL, [""])
-                    .expect("valid issuer")
-                    .authorized_party(String::new()),
-            ),
-    );
+    // `validate` still owns every rule a type cannot state, and it reports all
+    // of them in one pass. On a deployment where the process dies at boot, each
+    // fix-and-restart is an outage window, so a config with four mistakes must
+    // take one cycle, not four.
+    //
+    // Two problems that used to appear here have moved *earlier*, not away: a
+    // blank audience and a blank `azp` are now refused by `Audience::new` and
+    // `AuthorizedParty::new`, on the line that wrote them. They cannot reach
+    // `validate` at all, so this test names four rules that still can.
+    let mut config = AuthConfig::empty()
+        .with_issuer(Issuer::discover("http://identity.example", [AUDIENCE]).expect("valid issuer"))
+        .with_algorithms([])
+        .with_policy(CachePolicy {
+            min_fetch_gap: Duration::from_millis(1),
+            ..CachePolicy::default()
+        });
+    config.leeway = 10_000;
+
+    let err = problem(&config);
 
     for expected in [
         "no allowed signature algorithms",
-        "empty authorised party",
         "requires https",
-        "configured with an empty audience",
+        "leeway of 10000s",
+        "min_fetch_gap under 1s",
     ] {
         assert!(err.contains(expected), "missing `{expected}` from: {err}");
     }
     assert!(
         err.split(';').count() >= 4,
         "the problems should be listed, not just the first one: {err}"
+    );
+}
+
+#[tokio::test]
+async fn start_refuses_a_config_that_validate_refuses_before_touching_the_network() {
+    // `start` is the path a real deployment takes, and `validate` is its first
+    // statement. Pinned here rather than only through `validate` itself, because
+    // the two failure modes look nothing alike from the outside: an unusable
+    // configuration must arrive as `Configuration`, in the operator's own terms,
+    // and not as a provider timeout thirty seconds later that blames the issuer
+    // for the deployment's own typo.
+    //
+    // The issuer below is deliberately unreachable — port 1 on loopback, so
+    // nothing can answer it, at most one connection attempt that is refused at
+    // once. If `start` ever skipped `validate`, this test would fail with
+    // `ProviderUnavailable`, which is the bug it is watching for.
+    let unreachable =
+        url::Url::parse("http://127.0.0.1:1/realms/demo/jwks.json").expect("parse a JWKS URL");
+    let config = AuthConfig::empty()
+        .with_issuer(
+            Issuer::with_jwks_url("http://127.0.0.1:1/realms/demo", unreachable, [AUDIENCE])
+                .expect("valid issuer"),
+        )
+        .with_insecure_http(true)
+        .with_algorithms([]);
+
+    let err = Authenticator::start(config)
+        .await
+        .expect_err("a deployment with no algorithms cannot start");
+
+    assert!(
+        matches!(err, AuthError::Configuration(_)),
+        "an unusable config is the operator's, not the provider's: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("no allowed signature algorithms"),
+        "the same words `validate` uses, carried out of `start` unchanged: {err}"
+    );
+
+    // And the shape a caller reaches for by accident: `AuthConfig::empty()` on
+    // its own trusts nobody, which is a 401 on every route rather than a boot
+    // failure, unless `start` refuses it.
+    let err = Authenticator::start(AuthConfig::empty())
+        .await
+        .expect_err("an empty config authenticates nothing");
+    assert!(
+        matches!(err, AuthError::Configuration(_))
+            && err.to_string().contains("no trusted issuers"),
+        "{err:?}"
     );
 }
 
