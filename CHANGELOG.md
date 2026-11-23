@@ -5,6 +5,12 @@ All notable changes to this crate are recorded here. The format follows
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Being
 pre-1.0, a breaking change moves the minor number: `0.1.x` to `0.2.0`.
 
+## 0.3.1 - 2026-11-23
+
+### Security
+
+Bumps `url` to version 2.5.9 per https://rustsec.org/advisories/RUSTSEC-2026-0592
+
 ## 0.3.0 - 2026-11-18
 
 ### Fixed — one guard `0.3.0` said it had removed was still in the file
